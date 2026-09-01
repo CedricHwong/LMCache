@@ -1229,10 +1229,17 @@ class BlendModule(InstanceLivenessTarget):
                 uniq_keys.append(k)
             expanded_uidx.append(uidx)
 
+        # One read lock per reader, as the prefix leg does. The dedup above
+        # collapses the rank-expanded keys, and under MLA every rank expands to
+        # the SAME key -- so a single lock is handed to whichever rank retrieves
+        # first, and the other tp-1 releases underflow, unpinning the object
+        # while those ranks still need it (see require_num_kv_readers:
+        # "under-counting unpins an object mid-copy").
         handle: PrefetchHandle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=uniq_keys,
                 group_layout_descs=layouts,
+                num_kv_readers=key.require_num_kv_readers(),
                 policy=TrimPolicy.SPARSE,
                 attn_desc=_narrow_attn_desc(attn_desc, read.gids),
             ),
