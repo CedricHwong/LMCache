@@ -265,6 +265,7 @@ class StorageManager:
     def read_prefetched_results(
         self,
         keys: list[ObjectKey],
+        release_on_failure: bool = True,
     ) -> Iterator[list[MemoryObj] | None]:
         """
         Read the memory objects from L1 storage that has been prefetched beforehand.
@@ -278,10 +279,19 @@ class StorageManager:
             Iterator[list[MemoryObj] | None]: An iterator yielding an optional list of
                 memory objects corresponding to the requested keys.
 
+        Args:
+            keys: Object keys to read; must be read-locked (i.e. between
+                ``reserve_read`` and ``finish_read``).
+            release_on_failure: Release the read locks of the successfully read
+                objects when the batch fails. Default True (single-shot
+                readers). Pass False when the same reservation may be read
+                again -- the caller then owns the release.
+
         Note:
             If any object is not found in L1 storage, None is yielded. In this case,
             this function will release release the read lock of all successfully read
-            memory objects when exiting the context.
+            memory objects when exiting the context, unless
+            ``release_on_failure=False``.
 
             If the caller raised exception during the processing of the yielded memory
             objects, this function will ensure that the read locks will be decreased.
@@ -361,8 +371,15 @@ class StorageManager:
             raise
         finally:
             # Decrease the read lock for all successfully read memory objects
-            # if None is yielded or exception occurs during caller's processing
-            if not all_good or not successfully_yielded:
+            # if None is yielded or exception occurs during caller's processing.
+            # ``release_on_failure=False`` opts a caller out: one that may read
+            # the SAME reservation again (the CB retrieve -- vLLM re-runs it per
+            # partial/full block alloc, and it deliberately leaves unapplied
+            # matches locked for the follow-up) must not have a failed batch
+            # hand back locks its next attempt still needs. Those callers own
+            # the release; holding only risks pinning to the TTL, whereas
+            # releasing early strands every later reader.
+            if release_on_failure and (not all_good or not successfully_yielded):
                 self._l1_manager.finish_read(good_keys)
                 self._event_bus.publish(
                     Event(

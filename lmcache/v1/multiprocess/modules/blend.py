@@ -2918,8 +2918,14 @@ class BlendModule(InstanceLivenessTarget):
             # cb.scatter opens mid-try; track it so a failure closes the span.
             scatter_open = False
             try:
+                # release_on_failure=False: vLLM re-runs this retrieve per
+                # block-alloc round (measured up to 6x for one request) and the
+                # lookup read-locked these keys ONCE. Letting a failed batch
+                # release them leaves every later attempt reading
+                # KEY_NOT_READABLE; _release_scattered_locks and the orphan
+                # sweep own the release instead.
                 with self._ctx.storage_manager.read_prefetched_results(
-                    all_obj_keys
+                    all_obj_keys, release_on_failure=False
                 ) as memory_objs:
                     _stage_ms["fetch"] = (time.perf_counter() - _stage_t) * 1000
                     if memory_objs is None:
