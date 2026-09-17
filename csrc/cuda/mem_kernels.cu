@@ -57,6 +57,52 @@ inline void check_head_size(const EngineKVFormat engine_kv_format,
               static_cast<int>(engine_kv_format));
 }
 
+// Formats whose page_buffer_offset decomposes the per-token flat scalar offset
+// by dividing ``scalars_per_token`` by the per-head width ``head_size``. When
+// the declared ``head_size`` does not actually divide ``scalars_per_token``
+// the quotient silently truncates -- historically to 0 for single-head fused
+// K/V content (num_heads == C/(2*C) == 0 with the old doubled width), which
+// corrupted every transfer with no error. Unlike check_head_size (only demands
+// head_size > 0), this helper requires the two values to be arithmetically
+// self-consistent, and is applied to exactly the formats that decompose heads.
+inline bool uses_head_decomposition(const EngineKVFormat engine_kv_format) {
+  return engine_kv_format ==
+             EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||  // flash attn HND
+         engine_kv_format ==
+             EngineKVFormat::NL_X_NB_TWO_NH_BS_HS ||  // flash infer HND
+         engine_kv_format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS ||
+         engine_kv_format == EngineKVFormat::NL_X_NB_NH_BS_CS;
+}
+
+// All sizes are in xword (transfer-unit) units, as produced by
+// ``head_size / elements_per_xword`` and ``num_origin_elements /
+// elements_per_xword`` in the host template functions.
+inline void check_head_decomposition_consistency(
+    const EngineKVFormat engine_kv_format, const int head_size,
+    const int scalars_per_token) {
+  if (!uses_head_decomposition(engine_kv_format)) {
+    return;
+  }
+  if (head_size <= 0) {
+    TORCH_CHECK(false,
+                "head_size is required (must be > 0) to decompose scalar "
+                "offsets for EngineKVFormat ",
+                static_cast<int>(engine_kv_format));
+  }
+  const int num_heads = scalars_per_token / head_size;
+  TORCH_CHECK(
+      scalars_per_token % head_size == 0 && num_heads >= 1,
+      "EngineKVFormat ", static_cast<int>(engine_kv_format),
+      " cannot decompose scalars_per_token=", scalars_per_token,
+      " with head_size=", head_size, " (num_heads would be ", num_heads,
+      "). The declared head_size must divide the per-token content size into "
+      "a positive whole number of heads. For fused K/V formats "
+      "(NL_X_NB_NH_BS_TWO_HS / NL_X_NB_NH_BS_CS) head_size must be the FULL "
+      "per-head content width (CS == 2*HS, i.e. KVFormatSpec.head_size()), "
+      "not half of it -- passing HS here silently doubles the in-block token "
+      "stride and zeroes num_heads.");
+}
+
 template <typename scalar_t>
 __global__ void load_and_reshape_flash_kernel(
     scalar_t* __restrict__ key_value,  // [num_tokens, num_heads, head_size]
@@ -294,19 +340,31 @@ page_buffer_offset(const int k_or_v, const int token_idx,
            head_offset;
   } else if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS ||
                        format == EngineKVFormat::NL_X_NB_NH_BS_CS) {
-    const int hs2 = 2 * head_size;  // packed K+V width per head (xword units)
+    // Per-head PACKED content width, in xword units. Both fused formats
+    // carry K and V packed in the trailing axis (CS == 2*HS), so the
+    // head width the caller must pass is the FULL content size CS, exactly
+    // what KVFormatSpec.head_size() / desc.hs return -- NOT the per-K half
+    // width HS, and NOT doubled. Using the width directly keeps this branch
+    // consistent with (a) mp_mem_kernels.cu, which uses scalars_per_head()
+    // untouched, (b) the NHD sibling branch below (pure token-major), and
+    // (c) the Python spec (head_size() == shape[-1] == CS). The historical
+    // ``hs2 = 2 * head_size`` here silently made num_heads = CS/(2*CS) = 0
+    // for single-head content and doubled the in-block token stride; the
+    // host-side consistency check (check_head_decomposition_consistency)
+    // now turns that misconfiguration into a loud error.
+    const int hs = head_size;
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
-    const int head_idx = scalar_offset / hs2;
-    const int head_offset = scalar_offset % hs2;
-    const int num_heads = scalars_per_token / hs2;
+    const int head_idx = scalar_offset / hs;
+    const int head_offset = scalar_offset % hs;
+    const int num_heads = scalars_per_token / hs;
     // vLLM blocks-first pools pass the real per-block step; 0 means tight.
     const int64_t block_step =
         block_stride_xwords > 0
             ? block_stride_xwords
-            : static_cast<int64_t>(num_heads) * block_size * hs2;
-    return block_idx * block_step + head_idx * block_size * hs2 +
-           block_offset * hs2 + head_offset;
+            : static_cast<int64_t>(num_heads) * block_size * hs;
+    return block_idx * block_step + head_idx * block_size * hs +
+           block_offset * hs + head_offset;
   } else if constexpr (format == EngineKVFormat::NL_X_NB_BS_NH_TWO_HS ||
                        format == EngineKVFormat::NL_X_NB_BS_NH_CS) {
     const int block_idx = token_idx / block_size;
@@ -654,6 +712,8 @@ void multi_layer_kv_transfer_templated(
 
   lmc::check_block_size(engine_kv_format, block_size);
   lmc::check_head_size(engine_kv_format, head_size_xword);
+  lmc::check_head_decomposition_consistency(engine_kv_format, head_size_xword,
+                                            num_xwords);
   // 0 means tight; the per-format offset entries compute their own tight step.
   const int64_t block_stride_xwords = block_stride_elems / elements_per_xword;
   TORCH_CHECK(
@@ -806,6 +866,8 @@ void multi_layer_kv_transfer_fused_templated(
 
   lmc::check_block_size(engine_kv_format, block_size);
   lmc::check_head_size(engine_kv_format, head_size_xword);
+  lmc::check_head_decomposition_consistency(engine_kv_format, head_size_xword,
+                                            num_xwords);
   // 0 means tight; the per-format offset entries compute their own tight step.
   const int64_t block_stride_xwords = block_stride_elems / elements_per_xword;
   TORCH_CHECK(

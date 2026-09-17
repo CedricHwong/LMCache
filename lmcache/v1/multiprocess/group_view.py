@@ -64,6 +64,76 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     KV; the one-block window reflects restore semantics and blend full-window
     forcing must not widen it. Defaulted field: wire-compatible."""
 
+    # ------------------------------------------------------------------
+    # DeepSeek V4.1 metadata (phase-1 freeze contract: appended LAST, all
+    # defaulted so msgspec.Struct IPC stays wire-compatible both ways).
+    #   * new consumers reading old payloads: missing keys fall back to
+    #     these defaults (object/map encoding);
+    #   * old consumers reading new payloads: without forbid_unknown_fields
+    #     msgspec ignores the extra keys.
+    #   * appending (never inserting) keeps every positional construction
+    #     site (tests, qringbuffer, bench client) positionally valid, and
+    #     keeps the "fields with defaults follow fields without" msgspec rule.
+    # ------------------------------------------------------------------
+    tokens_per_state: int = 1
+    """Tokens covered by one stored state for this group — DeepSeek V4.1
+    sparse-MLA ``tokens_per_state`` (nightly vLLM renamed
+    ``MLAAttentionSpec.compress_ratio`` to this): ``0`` = sliding window,
+    ``1`` / ``2`` = compressed. ``1`` = one token per state (also the fallback
+    when the engine does not report it).
+
+    This is a *state* (token) quantity and is distinct from
+    ``tokens_per_block``: the latter is the logical token span of one paged
+    chunk (one engine block ID) and is what :func:`slice_block_ids_per_group`
+    consumes. ``tokens_per_state`` must never be fed into
+    ``group_tokens_per_block`` in place of ``tokens_per_block`` — the two
+    have different units and mixing them corrupts per-group block-id counts.
+    Defaulted field: wire-compatible."""
+
+    cache_role: str = "sparse"
+    """Role of this group's cache in the V4.1 architecture: ``"sparse"``
+    (regular sparse-KV group) or ``"indexer"`` (indexer/summary cache).
+    Mirrors vLLM's ``SparseCacheRole`` (str enum, values ``"sparse"`` /
+    ``"indexer"``). Defaults to ``"sparse"`` because the V4.1 indexer spec
+    does *not* set ``cache_role`` (only V3.2 does); the default keeps
+    indexer groups indistinguishable the same way the engine leaves them.
+    Defaulted field: wire-compatible."""
+
+    state_content_bytes: int | None = None
+    """Per ``(head slot, stored state)`` cell size in bytes when the page is
+    packed (nightly ``AttentionSpec.state_content_bytes``); ``None`` means
+    dense K/V content and consumers fall back to tensor-detected sizes.
+    Defaulted field: wire-compatible."""
+
+    block_stride_alignment: int | None = None
+    """Required byte alignment of the distance between consecutive blocks of
+    this cache. In block-major layouts that distance is the whole block, so
+    the allocator rounds the block up to it (e.g. DeepGEMM paged kernels
+    address pages as ``base + page * stride`` and need it 512B-aligned).
+    ``None`` = no alignment reported. Defaulted field: wire-compatible."""
+
+    is_index_group_leader: bool = False
+    """Whether this group is the leader that publishes index (summary) blocks
+    shared by other groups. Defaults to ``False`` because the V4.1 indexer
+    spec does *not* set it (only V3.2 does). Defaulted field:
+    wire-compatible."""
+
+    prefix_cacheable: bool = True
+    """Whether this group's pages participate in prefix caching, mirroring
+    nightly ``KVCacheSpec.prefix_cacheable``. ``True`` = cacheable (the
+    engine default). Defaulted field: wire-compatible."""
+
+    page_size_padded: int | None = None
+    """Padded page size in bytes when the engine rounds the page up to an
+    alignment (nightly ``AttentionSpec.page_size_padded``); ``None`` =
+    unpadded page. Defaulted field: wire-compatible."""
+
+    num_head_slots: int | None = None
+    """Logical head count ``H`` of the ``[B, H, N, C]`` page when packing
+    diverges from one slot per KV head (nightly
+    ``AttentionSpec.num_head_slots``); ``None`` = one slot per KV head.
+    Defaulted field: wire-compatible."""
+
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:
     """Return the number of engine groups (block-id lists per transfer request).

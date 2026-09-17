@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping, Sequence
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -19,6 +20,21 @@ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 logger = init_logger(__name__)
 
 
+def _first_leaf_spec(spec: Any) -> Any:
+    """Return the leaf spec behind a ``UniformTypeKVCacheSpecs`` wrapper.
+
+    The wrapper holds one spec per layer; ``UniformTypeKVCacheSpecs`` only
+    groups same-typed layers (vLLM ``is_uniform_type`` requires one shared
+    registry base class *and* one block size), so the first leaf is
+    representative for the layer-type-derived fields this module reads.
+    Every other spec is its own leaf.
+    """
+    inner = getattr(spec, "kv_cache_specs", None)
+    if isinstance(inner, dict) and inner:
+        return next(iter(inner.values()))
+    return spec
+
+
 def _is_attention_spec(spec: Any) -> bool:
     """Return whether the KV cache spec is a vLLM attention spec.
 
@@ -26,20 +42,150 @@ def _is_attention_spec(spec: Any) -> bool:
     ``UniformTypeKVCacheSpecs`` is unwrapped first (same-typed layers, one
     leaf suffices); it does not derive from ``AttentionSpec`` itself.
     """
-    inner = getattr(spec, "kv_cache_specs", None)
-    if isinstance(inner, dict) and inner:
-        spec = next(iter(inner.values()))
+    spec = _first_leaf_spec(spec)
     return any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
+
+
+def resolve_tokens_per_state(spec: Any) -> int:
+    """Resolve the tokens covered by one stored state, as a positive int.
+
+    Reads vLLM nightly's ``AttentionSpec.tokens_per_state`` first and falls
+    back to the removed ``MLAAttentionSpec.compress_ratio`` so vLLM v0.21.0
+    keeps working. The value does **not** change how many tokens an engine
+    block id spans (that stays ``block_size`` — see
+    :func:`get_tokens_per_block`); it describes the *state* count inside a
+    block (``block_size // tokens_per_state``), which LMCache re-derives from
+    the registered tensors as ``slots_per_block``.
+
+    A ``Fraction`` -- several states per token, e.g. Whisper block pooling --
+    cannot be represented by LMCache's integer ``tokens_per_block //
+    slots_per_block`` compression model, so it raises instead of silently
+    truncating. Non-positive values carry no per-state width and resolve to
+    the uncompressed default: ``0`` is vLLM's sliding-window marker
+    (``DeepseekV41`` layers with ``compress_ratio=0``), ``-1`` the
+    ``MambaSpec`` sentinel.
+
+    Args:
+        spec: A vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``
+            wrapper; the wrapper is unwrapped to its first leaf).
+
+    Returns:
+        The positive integer tokens per stored state; ``1`` when the spec
+        declares no compression.
+
+    Raises:
+        ValueError: If the declared value is a ``Fraction``.
+    """
+    leaf = _first_leaf_spec(spec)
+    tokens_per_state = getattr(leaf, "tokens_per_state", None)
+    if tokens_per_state is None:
+        tokens_per_state = getattr(leaf, "compress_ratio", None)
+    if tokens_per_state is None:
+        return 1
+    if isinstance(tokens_per_state, Fraction):
+        raise ValueError(
+            "fractional tokens_per_state "
+            f"{tokens_per_state!r} is not representable by LMCache's integer "
+            "compression model (tokens per block / slots per block)"
+        )
+    if not isinstance(tokens_per_state, int):
+        return 1
+    return tokens_per_state if tokens_per_state > 0 else 1
+
+
+def read_v41_spec_fields(spec: Any) -> dict[str, Any]:
+    """Fault-tolerant read of the vLLM V4.1 spec fields LMCache carries.
+
+    Returns exactly the eight ``EngineGroupInfo`` tail fields added for the
+    V4.1 schema, with the contract defaults wherever the spec -- or the whole
+    vLLM version -- does not declare them, so the caller can spread the result
+    as ``EngineGroupInfo(**fields)`` without losing msgspec wire compatibility:
+
+    ``tokens_per_state=1``, ``cache_role="sparse"``,
+    ``state_content_bytes=None``, ``block_stride_alignment=None``,
+    ``is_index_group_leader=False``, ``prefix_cacheable=True``,
+    ``page_size_padded=None``, ``num_head_slots=None``.
+
+    Every read goes through ``getattr`` with a default (never bare attribute
+    access), and a ``UniformTypeKVCacheSpecs`` wrapper is unwrapped to its
+    first leaf, so neither a nightly/older field layout nor a missing
+    attribute can raise ``AttributeError``. ``cache_role`` is normalized from
+    the ``SparseCacheRole`` enum to its ``str`` value; ``prefix_cacheable``
+    prefers the wrapper's property (which ANDs its leaves) when present.
+
+    Args:
+        spec: A vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``).
+
+    Returns:
+        An eight-key dict safe to pass as ``EngineGroupInfo(**fields)``.
+    """
+    leaf = _first_leaf_spec(spec)
+    cache_role = getattr(leaf, "cache_role", None)
+    if cache_role is not None:
+        cache_role = getattr(cache_role, "value", cache_role)
+    prefix_cacheable = getattr(spec, "prefix_cacheable", None)
+    if prefix_cacheable is None:
+        prefix_cacheable = getattr(leaf, "prefix_cacheable", True)
+    return {
+        "tokens_per_state": resolve_tokens_per_state(leaf),
+        "cache_role": cache_role if cache_role else "sparse",
+        "state_content_bytes": getattr(leaf, "state_content_bytes", None),
+        "block_stride_alignment": getattr(leaf, "block_stride_alignment", None),
+        "is_index_group_leader": bool(getattr(leaf, "is_index_group_leader", False)),
+        "prefix_cacheable": bool(prefix_cacheable),
+        "page_size_padded": getattr(leaf, "page_size_padded", None),
+        "num_head_slots": getattr(leaf, "num_head_slots", None),
+    }
 
 
 def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
+    The returned value lives in the scheduler's *token* coordinate space: one
+    engine block id always covers ``block_size`` tokens, exactly how vLLM
+    sizes the block table (``max_num_blocks_per_req = cdiv(max_len,
+    block_size)``) regardless of how many states a block stores. So
+    ``tokens_per_state`` does not change the number returned -- what it
+    changes is the number of stored states inside each block
+    (``block_size // tokens_per_state``), which LMCache detects on the tensor
+    side as ``slots_per_block`` (the block tensor's batch dimension). The
+    relationship is:
+
+        ``tokens_per_block // slots_per_block == tokens_per_state``
+
+    i.e. the compression factor is re-derived downstream from the
+    block-id-to-token span and the physical slot count, and must **not** be
+    folded into ``tokens_per_block`` here (LMCache's ``compress_ratio =
+    tokens_per_block // slots_per_block`` path would then double-count it).
+
+    What this function does with ``tokens_per_state`` is validate it: a
+    ``Fraction`` is unrepresentable in the integer compression model and a
+    non-divisor would make vLLM's ``get_num_kernel_states`` drop the tail
+    tokens, so both fail closed instead of corrupting later arithmetic.
+
     Attention blocks span ``block_size * dcp_size`` tokens under DCP
     (vLLM's ``resolve_kv_cache_block_sizes`` rule); recurrent state is
     replicated, not sharded, and stays at ``block_size``.
+
+    Args:
+        kv_cache_spec: vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``).
+        dcp_size: Decode context parallel size.
+
+    Returns:
+        Logical tokens per engine block id.
+
+    Raises:
+        ValueError: If the spec declares a fractional ``tokens_per_state``, or
+            an integer one that does not divide ``block_size``.
     """
     block_size = kv_cache_spec.block_size
+    tokens_per_state = resolve_tokens_per_state(kv_cache_spec)
+    if tokens_per_state > 1 and block_size % tokens_per_state != 0:
+        raise ValueError(
+            f"tokens_per_state {tokens_per_state} does not divide block_size "
+            f"{block_size}; vLLM's get_num_kernel_states would drop the tail "
+            "tokens"
+        )
     if dcp_size <= 1:
         return block_size
     if _is_attention_spec(kv_cache_spec):
@@ -315,6 +461,10 @@ def create_engine_group_infos_from_vllm(
     # wrong-block-size group would corrupt the per-group block-id counts).
     per_layer_group_idx: list[int] | None = None
     group_tokens_per_block: dict[int, int] = {}
+    # V4.1 schema fields per engine group, keyed by engine group id; the
+    # vLLM merge asserts these are identical across a group's layers
+    # (``MLAAttentionSpec.merge``), so one read per engine group suffices.
+    per_engine_v41_fields: dict[int, dict[str, Any]] = {}
     per_layer_sw_size = [-1] * num_layers
     per_layer_recurrent = [False] * num_layers
     if vllm_groups:
@@ -326,6 +476,9 @@ def create_engine_group_infos_from_vllm(
             # Under DCP the two diverge (see get_tokens_per_block).
             group_tokens_per_block[engine_group_id] = get_tokens_per_block(
                 group.kv_cache_spec, dcp_size
+            )
+            per_engine_v41_fields[engine_group_id] = read_v41_spec_fields(
+                group.kv_cache_spec
             )
             for name in group.layer_names:
                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
@@ -375,6 +528,11 @@ def create_engine_group_infos_from_vllm(
             # --separate-object-groups, after the regular groups.
             extra_object_group_tag=aux_group_tags.get(identity.engine_group_idx, 0),
             recurrent_state=_merge_layer_recurrent(per_layer_recurrent, indices),
+            # V4.1 schema fields (read_v41_spec_fields) keyed by engine group
+            # id; engine groups without a spec (aux pools, non-hybrid single
+            # group, old vLLM) get no kwargs and fall through to the struct's
+            # contract defaults.
+            **per_engine_v41_fields.get(identity.engine_group_idx, {}),
         )
         for identity, indices in group_layers_by_identity(
             normalized_kv_caches,

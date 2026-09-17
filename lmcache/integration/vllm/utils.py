@@ -34,6 +34,26 @@ ENGINE_NAME = "vllm-instance"
 _config_instance: Optional[LMCacheEngineConfig] = None
 _config_lock = threading.Lock()
 
+# Complete vLLM ``KVCacheLayout`` member -> LMCache layout name table (the
+# enum is ``vllm/vllm/v1/kv_cache_layout.py``, 6 members, value = 5-ary stride
+# permutation of ``[L, B, H, N, C]``). The two heads-outermost members
+# (``LHBNC = [L, H, B, N, C]``, ``BHLNC = [B, H, L, N, C]``) fragment each
+# ``(layer, block)`` into per-head slabs, which LMCache's transfer kernels
+# (one contiguous run per (layer, block)) cannot address: they are rejected,
+# never silently mis-read. ``LBHNC = [L, B, H, N, C]`` (the identity) is NOT
+# heads-outermost and maps to HND like ``BLHNC`` does.
+_VLLM_LAYOUT_TO_LMCACHE: dict[str, KVLayoutName] = {
+    "NHD": "NHD",  # legacy alias
+    "HND": "HND",  # legacy alias
+    "LBNHC": "NHD",  # [L, B, N, H, C] layer-compact, NHD bytes
+    "LBHNC": "HND",  # [L, B, H, N, C] layer-compact, HND bytes
+    "BLHNC": "BLHNC",  # [B, L, H, N, C] blocks-first, HND bytes
+    "BLNHC": "BLNHC",  # [B, L, N, H, C] blocks-first, NHD bytes
+}
+_VLLM_LAYOUT_TO_LMCACHE_HEADS_OUTERMOST: frozenset[str] = frozenset(
+    ("LHBNC", "BHLNC")
+)
+
 
 def is_false(value: str) -> bool:
     """Check if the given string value is equivalent to 'false'."""
@@ -51,29 +71,31 @@ def vllm_layout_hints(vllm_config: "VllmConfig | None" = None) -> "LayoutHints":
 
 def translate_vllm_kv_cache_layout(kv_cache_layout: str) -> KVLayoutName:
     """Map a vLLM ``KVCacheLayout`` member name to LMCache's name
-    (``LBNHC`` -> ``NHD``, ``LBHNC`` -> ``HND``).
+    (``LBNHC`` -> ``NHD``, ``LBHNC`` -> ``HND``, blocks-first kept as-is).
+
+    The mapping is the complete 6-member table (``_VLLM_LAYOUT_TO_LMCACHE``);
+    the declared layout is the single source of truth that downstream
+    detection must observe, so an untransferable declaration fails fast here
+    rather than being downgraded to a best-effort guess downstream.
 
     Raises:
-        NotImplementedError: for layouts LMCache cannot transfer.
+        NotImplementedError: for ``LHBNC`` / ``BHLNC`` (heads-outermost, the
+            per-block content is fragmented per head and cannot be
+            transferred) and for unknown names.
     """
-    names = {
-        "NHD": "NHD",
-        "HND": "HND",
-        "LBNHC": "NHD",
-        "LBHNC": "HND",
-        "BLHNC": "BLHNC",
-        "BLNHC": "BLNHC",
-    }
-    translated = names.get(kv_cache_layout)
-    if translated is not None:
-        return translated  # type: ignore[return-value]
-    # TODO: support heads-outermost layouts; the transfer kernels address
-    # one contiguous run per (layer, block), which these fragment per head.
+    if kv_layout_cache := _VLLM_LAYOUT_TO_LMCACHE.get(kv_cache_layout):
+        return kv_layout_cache
+    if kv_cache_layout in _VLLM_LAYOUT_TO_LMCACHE_HEADS_OUTERMOST:
+        raise NotImplementedError(
+            f"LMCache does not support the {kv_cache_layout!r} KV cache "
+            "layout: its head axis is outer to the per-block token run, so "
+            "each (layer, block) is fragmented per head. If it was selected "
+            "via VLLM_KV_CACHE_LAYOUT, unset it or choose LBNHC, LBHNC, "
+            "BLHNC, or BLNHC."
+        )
     raise NotImplementedError(
-        f"LMCache does not support the {kv_cache_layout!r} KV cache "
-        "layout: per-block content is fragmented per head. If it was "
-        "selected via VLLM_KV_CACHE_LAYOUT, unset it or choose LBNHC, "
-        "LBHNC, BLHNC, or BLNHC."
+        f"LMCache does not support the unknown {kv_cache_layout!r} KV cache "
+        "layout; expected one of NHD, HND, LBNHC, LBHNC, BLHNC, BLNHC."
     )
 
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import TypeAlias
 
 # Third Party
@@ -75,16 +76,123 @@ _SUBPAGEABLE_ATTENTION_KINDS = frozenset(
 )
 
 
+#: ``(cache_role, is_index_group_leader)`` combinations the transfer path can
+#: serve today. ``""`` is the undeclared role (vLLM older than
+#: ``SparseCacheRole``, non-attention specs, non-vLLM engines); ``"sparse"``
+#: is ``SparseCacheRole.SPARSE``, the main sparse-MLA KV whose pages LMCache
+#: stores and retrieves. The leader flag may be either value: vLLM sets it on
+#: a *sparse-role* MLA spec whenever the layer owns an indexer
+#: (``mla_attention.py:1372``), so rejecting it would reject every indexed MLA
+#: model. ``SparseCacheRole.INDEXER`` groups (the index-key cache) are
+#: deliberately NOT whitelisted: they are addressed by the indexer's own
+#: kernels, and serving them needs the per-group store/load masks LMCache does
+#: not implement yet (see :func:`validate_kv_cache_groups`).
+_ALLOWED_CACHE_ROLE_COMBOS: frozenset[tuple[str, bool]] = frozenset(
+    {
+        ("", False),
+        ("", True),
+        ("sparse", False),
+        ("sparse", True),
+    }
+)
+
+
+def _declared_tokens_per_state(spec: KVCacheSpec) -> int | Fraction | None:
+    """Return a spec's declared tokens-per-state, or ``None`` when undeclared.
+
+    Reads vLLM nightly's ``AttentionSpec.tokens_per_state`` field first and
+    falls back to the removed ``MLAAttentionSpec.compress_ratio`` so old vLLM
+    still works. Both are instance fields of frozen dataclasses (neither
+    version's spec classes use ``slots``), so only a *declared* field lands in
+    the instance ``__dict__``. Reading through ``__dict__`` deliberately skips
+    the base-class ``KVCacheSpec.tokens_per_state`` *property* (nightly
+    ``kv_cache_interface.py:172``), which raises ``NotImplementedError`` when
+    accessed on specs that do not carry the field (e.g. the
+    ``UniformTypeKVCacheSpecs`` wrapper) and never appears in ``__dict__``.
+
+    Args:
+        spec: A leaf vLLM KV cache spec.
+
+    Returns:
+        The declared value (``1`` when the spec carries the field at its
+        default), or ``None`` when the spec declares neither field.
+    """
+    if "tokens_per_state" in getattr(spec, "__dict__", {}):
+        return spec.tokens_per_state
+    if "compress_ratio" in getattr(spec, "__dict__", {}):
+        return spec.compress_ratio
+    return None
+
+
+def _normalize_cache_role(role: object) -> str:
+    """Return a spec's cache role as its wire string (``""`` when undeclared).
+
+    Args:
+        role: The raw ``cache_role`` attribute (a ``SparseCacheRole``, a plain
+            string, or ``None`` on old vLLM and non-attention specs).
+
+    Returns:
+        The enum's ``value`` for enums, the string itself for strings, and
+        ``""`` when the role is missing or not string-like.
+    """
+    if role is None:
+        return ""
+    value = getattr(role, "value", role)
+    return value if isinstance(value, str) else ""
+
+
 def _declares_slot_compression(spec: KVCacheSpec) -> bool:
     """Return whether a spec declares slot compression (must not be edited).
 
-    Covers ``MLAAttentionSpec.compress_ratio > 1`` (DeepSeek-V4 slot packing)
-    and ``TQFullAttentionSpec.tq_slot_size > 0`` (TurboQuant slots); such
-    groups belong to the compression path in ``lmcache.v1.kv_layer_groups``.
+    Covers ``AttentionSpec.tokens_per_state > 1`` (DeepSeek-V4/-V4.1 slot
+    packing, renamed from the removed ``MLAAttentionSpec.compress_ratio``,
+    which is still honored), fractional ``tokens_per_state`` (Whisper block
+    pooling, several states per token), a *declared* ``storage_block_size``
+    (a storage width differing from the kernel block, e.g. GLM-5-style kpool
+    views), and ``TQFullAttentionSpec.tq_slot_size > 0`` (TurboQuant slots);
+    such groups belong to the compression path in
+    ``lmcache.v1.kv_layer_groups``, never to the re-view edits below.
+
+    ``storage_block_size`` counts only when it is a real instance field with a
+    non-``None`` value. vLLM v0.21.0 exposed it as a *property* computed from
+    ``block_size`` / ``compress_ratio`` (``vllm-0.21.0-ref/.../kv_cache_interface.py``
+    :101, :337-338, :491-492) that always yields an int, so a bare ``is not
+    None`` would claim compression for every old spec and silently disable the
+    re-view edits; nightly replaced the property with a dataclass field
+    (``vllm/.../kv_cache_interface.py:644``) whose ``None`` default means "no
+    storage geometry declared". A property never lands in the spec's instance
+    ``__dict__`` while a dataclass field always does, so the membership check
+    (the same trick as :func:`_declared_tokens_per_state`) isolates nightly
+    field instances and leaves old-vLLM derived values alone.
+
+    Args:
+        spec: A vLLM KV cache spec (a leaf, or a ``UniformTypeKVCacheSpecs``
+            wrapper; the wrapper's leaves are inspected -- vLLM guarantees
+            their compression-relevant fields agree within one group).
+
+    Returns:
+        ``True`` when any leaf spec declares slot compression.
     """
-    return (
-        getattr(spec, "compress_ratio", 1) > 1 or getattr(spec, "tq_slot_size", 0) > 0
+    return any(
+        _leaf_declares_slot_compression(leaf) for leaf in _leaf_specs(spec)
     )
+
+
+def _leaf_declares_slot_compression(spec: KVCacheSpec) -> bool:
+    """Return whether a single leaf spec declares slot compression."""
+    if "tq_slot_size" in getattr(spec, "__dict__", {}) and spec.tq_slot_size > 0:
+        return True
+    if (
+        "storage_block_size" in getattr(spec, "__dict__", {})
+        and spec.storage_block_size is not None
+    ):
+        return True
+    tokens_per_state = _declared_tokens_per_state(spec)
+    if isinstance(tokens_per_state, Fraction):
+        return tokens_per_state != 1
+    if isinstance(tokens_per_state, int) and not isinstance(tokens_per_state, bool):
+        return tokens_per_state > 1
+    return False
 
 
 def _leaf_specs(spec: KVCacheSpec) -> list[KVCacheSpec]:
@@ -104,11 +212,19 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
     - Mamba groups with ``mamba_cache_mode`` other than ``"align"`` or
       ``"all"``: the remaining mode (``"none"``) keeps no reusable per-block
       state snapshots.
+    - Groups whose ``(cache_role, is_index_group_leader)`` pair is outside
+      :data:`_ALLOWED_CACHE_ROLE_COMBOS`. Today that means
+      ``SparseCacheRole.INDEXER`` (index-key caches need the per-group store/
+      load masks LMCache has not implemented) and any role a future vLLM may
+      add; the undeclared role (old vLLM) and ``SparseCacheRole.SPARSE`` are
+      accepted, with either value of the leader flag.
 
-    Specs declaring slot compression (``compress_ratio > 1`` /
-    ``tq_slot_size > 0``, e.g. DeepSeek-V4) are NOT rejected: they are served
-    by the compression path in ``lmcache.v1.kv_layer_groups`` and merely
-    skipped by the edits here (see ``_declares_slot_compression``).
+    Specs declaring slot compression (``tokens_per_state > 1`` /
+    ``compress_ratio > 1`` / a *declared* ``storage_block_size`` (nightly
+    field only; v0.21.0's is a derived property and never triggers) /
+    ``tq_slot_size > 0``, e.g. DeepSeek-V4/-V4.1) are NOT rejected: they are
+    served by the compression path in ``lmcache.v1.kv_layer_groups`` and
+    merely skipped by the edits here (see ``_declares_slot_compression``).
 
     Args:
         kv_cache_config: vLLM ``KVCacheConfig``; ``None`` skips validation
@@ -116,6 +232,7 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
 
     Raises:
         ValueError: Listing every unsupported group and why.
+        ValueError: If the config's groups fail the whitelist check above.
     """
     if kv_cache_config is None:
         return
@@ -132,6 +249,15 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
                     f"group {group_idx}: MambaSpec with mamba_cache_mode="
                     f"'{getattr(spec, 'mamba_cache_mode', 'none')}' "
                     f"(only 'align' and 'all' keep reusable state snapshots)"
+                )
+            role = _normalize_cache_role(getattr(spec, "cache_role", None))
+            is_leader = bool(getattr(spec, "is_index_group_leader", False))
+            if (role, is_leader) not in _ALLOWED_CACHE_ROLE_COMBOS:
+                unsupported.append(
+                    f"group {group_idx}: unsupported cache_role={role!r} with "
+                    f"is_index_group_leader={is_leader} "
+                    f"(allowed combinations: "
+                    f"{sorted(_ALLOWED_CACHE_ROLE_COMBOS)})"
                 )
     if unsupported:
         raise ValueError(
@@ -549,6 +675,9 @@ def apply_kv_cache_group_edits(
     re-viewed by the matching rule; layers matching no rule pass through
     unchanged. ``None`` configs and configs without Mamba groups are returned
     as-is (as a dict): all current rules only apply to Mamba-hybrid models.
+    :func:`validate_kv_cache_groups` runs first on *every* config, so the
+    whitelist fail-fast below also guards pure-MLA models (e.g. DeepSeek-V4.1)
+    before this function returns on ``has_mamba_layers == False``.
 
     Args:
         kv_cache_config: vLLM ``KVCacheConfig`` (read for per-group specs).
