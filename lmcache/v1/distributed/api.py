@@ -16,6 +16,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.kv_format_fingerprint import namespace_object_chunk_hash
 
 if TYPE_CHECKING:
     # First Party
@@ -494,6 +495,7 @@ def ipc_key_to_object_keys(
     ipc_key: "IPCCacheServerKey",
     chunk_hashes: list[bytes],
     object_group_ids: list[int],
+    format_fingerprint: str = "",
 ) -> list[list[ObjectKey]]:
     """
     Convert a single IPCCacheServerKey and its chunk hashes to per-object-group
@@ -508,17 +510,35 @@ def ipc_key_to_object_keys(
     duplicating the source of truth would risk silent isolation bugs
     where a caller passes ``ipc_key`` but forgets the salt.
 
+    ``format_fingerprint`` namespaces the object identity by KV byte layout:
+    each chunk hash is passed through
+    :func:`~lmcache.v1.kv_format_fingerprint.namespace_object_chunk_hash`
+    before it becomes an ``ObjectKey.chunk_hash``. Two registrations whose
+    layouts differ (different ``--kv-cache-dtype``, block size, page padding,
+    ``tokens_per_state``, ...) therefore produce disjoint key spaces and can
+    never read each other's bytes. An empty fingerprint (the default) leaves
+    the chunk hash unchanged, which is what legacy callers without format
+    metadata get.
+
     Args:
         ipc_key: The IPC key providing model_name, world_size, worker_id,
             and cache_salt.
         chunk_hashes: List of chunk hash bytes, one per chunk.
         object_group_ids: Object group ids to produce keys for.
+        format_fingerprint: KV format fingerprint of the registering engine,
+            or ``""`` for no namespacing. Callers that have no format
+            metadata must pass the same value on store and lookup or the
+            keys will not match.
 
     Returns:
         list[list[ObjectKey]]: The i-th element is the list of ObjectKeys
         for ``object_group_ids[i]``.
     """
     cache_salt = ipc_key.cache_salt
+    namespaced_hashes = [
+        namespace_object_chunk_hash(chunk_hash, format_fingerprint)
+        for chunk_hash in chunk_hashes
+    ]
 
     # The (chunk_hash, kv_rank) expansion is independent of the object group,
     # so compute it once and reuse it for every group.
@@ -554,7 +574,7 @@ def ipc_key_to_object_keys(
                 object_group_id=object_group_id,
                 cache_salt=cache_salt,
             )
-            for chunk_hash in chunk_hashes
+            for chunk_hash in namespaced_hashes
             for kv_rank in kv_ranks
         ]
         for object_group_id in object_group_ids

@@ -18,6 +18,7 @@ from lmcache.v1.distributed.api import (
     ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
+from lmcache.v1.kv_format_fingerprint import resolve_object_key_fingerprint
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
@@ -74,7 +75,14 @@ def resolve_prefetched_obj_keys(
         if lo >= hi:
             continue
         group_hashes = chunk_hashes[lo - start_chunk : hi - start_chunk]
-        obj_keys.extend(ipc_key_to_object_keys(key, group_hashes, [group_idx])[0])
+        obj_keys.extend(
+            ipc_key_to_object_keys(
+                key,
+                group_hashes,
+                [group_idx],
+                resolve_object_key_fingerprint(ctx, key.model_name, key.world_size),
+            )[0]
+        )
     return obj_keys
 
 
@@ -587,7 +595,12 @@ class LookupModule:
         num_groups = self._ctx.layout_desc_registry.find_attn_desc(
             key.model_name, key.world_size
         ).num_object_groups
-        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
+        per_group = ipc_key_to_object_keys(
+            key,
+            chunk_hashes,
+            list(range(num_groups)),
+            resolve_object_key_fingerprint(self._ctx, key.model_name, key.world_size),
+        )
         if num_groups == 1:
             return per_group[0]
         # Each per-group list is chunk-major / rank-minor of length

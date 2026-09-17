@@ -16,6 +16,10 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.kv_format_fingerprint import (
+    KVGroupFormatDescriptor,
+    compute_format_fingerprint,
+)
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     RegisterEngineDrivenContextPayload,
@@ -350,7 +354,12 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         )
 
         self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
+            payload.model_name,
+            payload.world_size,
+            layout_desc,
+            format_fingerprint=self._format_fingerprint(
+                payload, dtype, num_physical_slots
+            ),
         )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
@@ -523,3 +532,46 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
                 time.perf_counter() - st,
             )
         return result
+
+    @staticmethod
+    def _format_fingerprint(
+        payload: RegisterEngineDrivenContextPayload,
+        dtype: torch.dtype,
+        num_physical_slots: int,
+    ) -> str:
+        """Fingerprint the non-GPU context's KV byte layout.
+
+        A non-GPU context declares no KV cache spec, so its layout is fully
+        described by the element dtype, whether the row is MLA-fused, the
+        flattened per-token width, and the physical slot count.
+
+        Args:
+            payload: The registration payload.
+            dtype: Resolved torch dtype of the KV tensors.
+            num_physical_slots: Physical slots gathered into one LMCache chunk.
+
+        Returns:
+            The format fingerprint for this registration.
+        """
+        descriptor = KVGroupFormatDescriptor(
+            engine_group_id=0,
+            dtype=str(dtype),
+            engine_kv_format="none",
+            kv_size=1 if payload.use_mla else 2,
+            num_blocks=0,
+            slots_per_block=num_physical_slots,
+            num_heads=payload.hidden_dim_size,
+            head_size=1,
+            element_size=dtype.itemsize,
+            block_stride_elems=0,
+            tokens_per_block=payload.block_size,
+            tokens_per_state=1,
+            sw_size_tokens=-1,
+            recurrent_state=False,
+            cache_role="sparse",
+            state_content_bytes=None,
+            block_stride_alignment=None,
+            page_size_padded=None,
+            num_head_slots=None,
+        )
+        return compute_format_fingerprint([descriptor], world_size=payload.world_size)

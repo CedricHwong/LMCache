@@ -831,7 +831,10 @@ class KVLayerGroupsManager:
                 mamba-style exclude).
 
         Returns:
-            One :class:`GroupBlockMask` per kernel group (protocol order).
+            One :class:`GroupBlockMask` per kernel group (protocol order). Each
+            mask's ``engine_group_id`` is this kernel group's
+            ``engine_group_idx``, the engine-side block-id list its block
+            indices belong to (kernel groups may share one engine group).
         """
         if segment_tokens is None:
             segment_tokens = self._lmcache_tokens_per_chunk
@@ -860,7 +863,10 @@ class KVLayerGroupsManager:
             exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
 
         Returns:
-            One :class:`GroupBlockMask` per kernel group (protocol order).
+            One :class:`GroupBlockMask` per kernel group (protocol order). Each
+            mask's ``engine_group_id`` is this kernel group's
+            ``engine_group_idx``, the engine-side block-id list its block
+            indices belong to (kernel groups may share one engine group).
         """
         return compute_group_lookup_masks(
             self._kernel_groups,
@@ -885,7 +891,10 @@ class KVLayerGroupsManager:
             exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
 
         Returns:
-            One :class:`GroupBlockMask` per kernel group (protocol order).
+            One :class:`GroupBlockMask` per kernel group (protocol order). Each
+            mask's ``engine_group_id`` is this kernel group's
+            ``engine_group_idx``, the engine-side block-id list its block
+            indices belong to (kernel groups may share one engine group).
         """
         if segment_tokens is None:
             segment_tokens = self._lmcache_tokens_per_chunk

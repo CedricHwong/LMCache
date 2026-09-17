@@ -25,6 +25,7 @@ import torch
 from lmcache import device_ops, torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.kv_format_fingerprint import resolve_object_key_fingerprint
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
@@ -748,7 +749,12 @@ class RetrieveMixin:
         else:
             # One key per (hash, read group), chunk-major like the cached path.
             all_obj_keys = _cb_chunk_major_object_keys(
-                key, [r.hash for r in cb_match_result], read_groups.blend_gids
+                key,
+                [r.hash for r in cb_match_result],
+                read_groups.blend_gids,
+                resolve_object_key_fingerprint(
+                    self._ctx, key.model_name, key.world_size
+                ),
             )
 
         # The connector may have dropped matches after the lookup read-locked

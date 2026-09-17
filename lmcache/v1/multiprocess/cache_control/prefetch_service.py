@@ -13,6 +13,7 @@ from typing import Any
 
 # First Party
 from lmcache.v1.distributed.api import Tier
+from lmcache.v1.kv_format_fingerprint import resolve_object_key_fingerprint
 from lmcache.v1.multiprocess.cache_control.errors import (
     InvalidRequest,
     NotFound,
@@ -77,7 +78,12 @@ class PrefetchService:
             )
         try:
             obj_keys, chunks = resolve_object_keys(
-                ctx.token_hasher, model_name, world_size, token_ids, cache_salt
+                ctx.token_hasher,
+                model_name,
+                world_size,
+                token_ids,
+                cache_salt,
+                resolve_object_key_fingerprint(ctx, model_name, world_size),
             )
         except ValueError as exc:
             raise InvalidRequest(str(exc)) from None

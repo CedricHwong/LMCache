@@ -1,0 +1,176 @@
+name: v4.1 Spec Gate
+
+# Offline regression gate for the DeepSeek-V4.1 x vLLM KV-cache-spec contract.
+#
+# LMCache reads vLLM's per-layer ``KVCacheSpec`` objects by attribute name, so a
+# vLLM nightly rename is *silent*: ``getattr(spec, "old_name", default)`` keeps
+# returning the default and LMCache carries on with the wrong block/slot/page
+# geometry instead of raising.  ``MLAAttentionSpec.compress_ratio`` becoming
+# ``AttentionSpec.tokens_per_state`` was exactly such a change.
+#
+# This workflow turns that class of drift into a CI failure:
+#   spec-contract  field-contract assertion against the vLLM revision pinned in
+#                  scripts/v41_spec_contract.json (fetches one file; stdlib only)
+#   offline-tests  the phase-1/2 v4.1 suite, CPU-only, against the pure-Python
+#                  lmcache_native shim -- no GPU, no vLLM install, no compiled ext
+#   vllm-drift     the same assertion against vLLM main on a schedule, so an
+#                  unreviewed upstream change is caught before the next bump
+#
+# NOTE: this workflow is prepared for the phase-1/2/3 adaptation PRs.  It starts
+# doing useful work as soon as those patches (and the contract file) are on the
+# target branch; nothing else has to be enabled.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      vllm_spec_url:
+        description: >-
+          Override the vLLM kv_cache_interface.py URL used by the drift job.
+        required: false
+        type: string
+  pull_request:
+    branches:
+      - "dev"
+      - "release-**"
+    paths:
+      - "lmcache/integration/vllm/**"
+      - "lmcache/v1/gpu_connector/kv_format/**"
+      - "lmcache/v1/kv_layer_groups.py"
+      - "lmcache/v1/multiprocess/group_view.py"
+      - "tests/v1/test_v41_*.py"
+      - "tests/v1/test_per_group_masks.py"
+      - "tests/v1/test_kv_cache_groups.py"
+      - "tests/v1/gpu_connector/test_v41_*.py"
+      - "scripts/check_v41_spec_contract.py"
+      - "scripts/v41_spec_contract.json"
+      - "scripts/v41_test_env.sh"
+      - "scripts/v41_stub_lmcache_native.py"
+      - ".github/workflows/v41_spec_gate.yml"
+  schedule:
+    # Daily drift check against vLLM main; 03:17 UTC avoids the top of the hour.
+    - cron: "17 3 * * *"
+
+env:
+  LC_ALL: en_US.UTF-8
+
+defaults:
+  run:
+    shell: bash
+
+# Cancel older in-flight runs on the same PR / branch.
+concurrency:
+  group: v41-spec-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  spec-contract:
+    name: v4.1 spec contract (pinned vLLM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Harden Runner"
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      # Downloads the single pinned vllm/v1/kv_cache_interface.py and asserts:
+      # no member was added/removed/retyped, every 'required' member is still
+      # named by lmcache/**/*.py, and the blob still matches the pinned hash.
+      - name: Assert the KV-cache-spec contract against the pinned vLLM
+        run: |
+          python scripts/check_v41_spec_contract.py \
+            --strict-pin \
+            --json-out v41-spec-contract-report.json
+
+      - name: Upload the contract report
+        if: always()
+        uses: actions/upload-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: v41-spec-contract-report
+          path: v41-spec-contract-report.json
+          if-no-files-found: warn
+
+  offline-tests:
+    name: v4.1 offline tests (stub native, CPU only)
+    runs-on: ubuntu-latest
+    env:
+      # The phase-1/2 v4.1 tests import lmcache.integration.vllm.utils and
+      # lmcache.v1.gpu_connector.kv_format at module scope, and that chain needs
+      # a real torch.nn.  A CPU wheel is enough: no GPU, no vLLM, and the
+      # lmcache_native C++ extension is replaced by the pure-Python shim.
+      V41_TORCH: "1"
+      V41_TORCH_INDEX_URL: "https://download.pytorch.org/whl/cpu"
+    steps:
+      - name: "Harden Runner"
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Run the v4.1 offline suite against the pure-Python native shim
+        run: |
+          bash scripts/v41_test_env.sh stub -- \
+            tests/v1/test_v41_spec_schema_p0.py \
+            tests/v1/test_v41_semantics_phase2.py \
+            tests/v1/test_per_group_masks.py \
+            tests/v1/test_kv_cache_groups.py \
+            tests/v1/gpu_connector/test_v41_cs_nh1_regression.py
+
+  vllm-drift:
+    name: vLLM nightly drift (main)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Harden Runner"
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.12"
+
+      # No --strict-pin here: the whole point is to run against a *newer* vLLM.
+      # Any added/removed/retyped spec member fails this job, which is the
+      # signal to re-review docs/02-v41-spec-field-reference.md, run
+      # --update-contract, classify the new members and re-pin.
+      - name: Assert the contract against vLLM main
+        env:
+          V41_DRIFT_SPEC_URL: ${{ inputs.vllm_spec_url }}
+        run: |
+          python scripts/check_v41_spec_contract.py \
+            --vllm-spec-file "${V41_DRIFT_SPEC_URL:-https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/kv_cache_interface.py}" \
+            --json-out v41-vllm-drift-report.json
+
+      - name: Upload the drift report
+        if: always()
+        uses: actions/upload-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: v41-vllm-drift-report
+          path: v41-vllm-drift-report.json
+          if-no-files-found: warn

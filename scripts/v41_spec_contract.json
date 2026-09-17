@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "description": "Reviewed contract between LMCache and the vLLM KV-cache-spec schema it reads. Maintained by scripts/check_v41_spec_contract.py --update-contract; every member's disposition must be re-reviewed on a vLLM bump. 'required' means the member is read by name on LMCache's vLLM-facing surface (lmcache/integration/vllm, lmcache/v1/multiprocess/group_view.py, lmcache/v1/kv_layer_groups.py, lmcache/v1/gpu_connector/kv_format).",
+  "pinned_vllm": {
+    "repo": "https://github.com/vllm-project/vllm",
+    "commit": "2e50824766ead3e30f53cba711e8c7ffb2bb6b2b",
+    "commit_date": "2026-09-17",
+    "spec_module": "vllm/v1/kv_cache_interface.py",
+    "spec_module_sha256": "a187dd20b9404bcdcd9f9e64bd1ccef821084bfb88330f16f6798e0672b74316",
+    "spec_url": "https://raw.githubusercontent.com/vllm-project/vllm/2e50824766ead3e30f53cba711e8c7ffb2bb6b2b/vllm/v1/kv_cache_interface.py",
+    "lmcache_tested_nightly": "0.29.1.dev202609161101",
+    "note": "commit is the DeepSeek-V4.1 adaptation baseline (notes/baseline-revisions.md); lmcache_tested_nightly is the version on the github_nightly_tested_vllm pin branch and is provenance only. The field diff, not the hash, is authoritative when running against a newer vLLM."
+  },
+  "tracked_classes": [
+    "KVCacheSpec",
+    "AttentionSpec",
+    "FullAttentionSpec",
+    "MLAAttentionSpec",
+    "SlidingWindowSpec",
+    "SlidingWindowMLASpec",
+    "CircularBufferSpec",
+    "UniformTypeKVCacheSpecs"
+  ],
+  "dispositions": {
+    "required": "LMCache must name this member in lmcache/**/*.py; blind => gate failure.",
+    "derived": "LMCache intentionally does not read this member by name; it re-derives the value from the registered KV tensors. Blind => warning only.",
+    "known_gap": "Reviewed, still-open gap outside the current adaptation scope. Blind => warning only, kept visible on purpose.",
+    "not_applicable_v41": "Present on a V4.1-reachable class but never set/consumed on the DeepSeek-V4.1 H100/SM90 path. Blind => warning only.",
+    "unreviewed": "Not yet classified; always a gate failure."
+  },
+  "members": {
+    "alignment": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "derived",
+      "reason": "vLLM folds page alignment into page_size_padded in _apply_alignment_padding (kv_cache_interface.py:626-632); LMCache reads the padded result, and never names spec.alignment on the vLLM read surface"
+    },
+    "attention_chunk_size": {
+      "kind": "field",
+      "owner": "FullAttentionSpec",
+      "disposition": "not_applicable_v41",
+      "reason": "chunked-local attention only; DeepSeek-V4.1/H100 runs MLA + SWA + the circular-buffer ring, never ChunkedLocalAttentionSpec"
+    },
+    "block_size": {
+      "kind": "field",
+      "owner": "KVCacheSpec",
+      "disposition": "required",
+      "reason": "tokens per engine block id; the base of every LMCache block geometry"
+    },
+    "block_stride_alignment": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "required",
+      "reason": "byte alignment of the distance between consecutive blocks (DeepGEMM paged sparse MQA-logits needs 512B)"
+    },
+    "block_table_token_alignment": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "derived",
+      "reason": "scheduler-side block-table token alignment; LMCache addresses blocks by engine block id, not through the block table"
+    },
+    "cache_dtype_str": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "derived",
+      "reason": "raw --kv-cache-dtype string; LMCache takes the storage dtype from the registered tensor instead"
+    },
+    "cache_role": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "required",
+      "reason": "distinguishes the sparse main cache from the indexer cache inside one group"
+    },
+    "dtype": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "storage dtype of the registered KV tensor"
+    },
+    "extra_retained_tokens": {
+      "kind": "field",
+      "owner": "SlidingWindowSpec",
+      "disposition": "not_applicable_v41",
+      "reason": "multi-module spec-decoding window retention; DeepSeek-V4.1's SWA spec leaves it at 0 (sparse_swa.py get_kv_cache_spec does not pass it)"
+    },
+    "first_spec": {
+      "kind": "property",
+      "owner": "UniformTypeKVCacheSpecs",
+      "disposition": "derived",
+      "reason": "convenience accessor for a wrapper's first leaf; LMCache's _first_leaf_spec implements the same"
+    },
+    "has_layer_views": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "derived",
+      "reason": "worker-side view flag; LMCache builds its layer views from the registered tensors"
+    },
+    "head_size": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "per-head K width"
+    },
+    "head_size_v": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "derived",
+      "reason": "MLA has no separate V; the content width is re-derived from the registered tensor's last dimension (see the 132B indexer detection)"
+    },
+    "is_index_group_leader": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "required",
+      "reason": "one-index-group leader flag; part of the group-role validation gate"
+    },
+    "kv_cache_specs": {
+      "kind": "field",
+      "owner": "UniformTypeKVCacheSpecs",
+      "disposition": "required",
+      "reason": "the per-layer leaf map of a UniformTypeKVCacheSpecs group"
+    },
+    "kv_quant_mode": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "derived",
+      "reason": "quantisation mode enum; the effective width is re-derived from the registered tensor"
+    },
+    "model_version": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "derived",
+      "reason": "V4.1 always writes 'deepseek_v4'; LMCache's layout detection keys on registered tensor geometry, not on this hint"
+    },
+    "non_causal": {
+      "kind": "field",
+      "owner": "FullAttentionSpec",
+      "disposition": "not_applicable_v41",
+      "reason": "vLLM documents it as scheduling-only: 'It does not affect the KV cache layout itself' (kv_cache_interface.py:546-552)"
+    },
+    "non_causal_multi_token_decode": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "known_gap",
+      "reason": "reviewed but still unreferenced: deferred out of the phase-1 8-field EngineGroupInfo contract (docs/phase1/03-p0-groupview.md). Defaults to False on the V4.1/H100 path, so it is not a correctness risk today, but it must be picked up before any V4.1 model enables non-causal multi-token decode."
+    },
+    "num_head_slots": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "logical page H when it diverges from num_kv_heads"
+    },
+    "num_heads": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "required",
+      "reason": "resolved logical page H (num_head_slots or num_kv_heads)"
+    },
+    "num_kv_heads": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "derived",
+      "reason": "LMCache takes head counts from vllm_config.model_config.get_num_kv_heads(...) and from the registered tensor geometry, not from AttentionSpec.num_kv_heads; the resolved logical H it does read is num_heads"
+    },
+    "num_states": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "derived",
+      "reason": "block_size // tokens_per_state; LMCache detects slots_per_block from the block tensor's batch dimension"
+    },
+    "page_size_bytes": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "required",
+      "reason": "full page size including padding"
+    },
+    "page_size_padded": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "padded page size; drives per-block byte geometry"
+    },
+    "prefix_cacheable": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "required",
+      "reason": "filters which engine groups LMCache caches (False for the circular-buffer ring)"
+    },
+    "real_page_size_bytes": {
+      "kind": "property",
+      "owner": "AttentionSpec",
+      "disposition": "derived",
+      "reason": "TPU compatibility alias of unpadded_page_size_bytes"
+    },
+    "sliding_window": {
+      "kind": "field",
+      "owner": "FullAttentionSpec",
+      "disposition": "required",
+      "reason": "SWA window size; drives hit-length validity for V4.1 SWA groups"
+    },
+    "state_content_bytes": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "packed bytes per (head slot, state) cell; replaces the hardcoded 132B indexer heuristic"
+    },
+    "state_content_size_bytes": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "derived",
+      "reason": "resolved default (head_size + head_size_v) * dtype_size; re-derived from the tensor"
+    },
+    "storage_block_size": {
+      "kind": "field",
+      "owner": "MLAAttentionSpec",
+      "disposition": "required",
+      "reason": "storage-view token width when it differs from the kernel block"
+    },
+    "tokens_per_state": {
+      "kind": "field",
+      "owner": "AttentionSpec",
+      "disposition": "required",
+      "reason": "renamed from compress_ratio; the compression factor LMCache must read instead of the old name"
+    },
+    "unpadded_page_size_bytes": {
+      "kind": "property",
+      "owner": "AttentionSpec",
+      "disposition": "derived",
+      "reason": "num_heads * num_states * state_content_size_bytes; re-derived from the tensor"
+    },
+    "uses_slot_mapping": {
+      "kind": "property",
+      "owner": "KVCacheSpec",
+      "disposition": "required",
+      "reason": "whether the worker computes slot mapping for this group"
+    }
+  }
+}

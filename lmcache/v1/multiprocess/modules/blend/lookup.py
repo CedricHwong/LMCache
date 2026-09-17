@@ -26,6 +26,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.bitmap_ops.fold import fold_unfold_ranked
 from lmcache.v1.distributed.storage_manager import PrefetchHandle
+from lmcache.v1.kv_format_fingerprint import resolve_object_key_fingerprint
 from lmcache.v1.mp_coordinator.api import BlendNamespace
 from lmcache.v1.mp_coordinator.blend_client import PENDING
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -184,7 +185,12 @@ class LookupMixin:
         read, layouts, attn_desc = resolved
         per_hash_obj_keys: dict[bytes, list] = {}
         all_hashes = [r.hash for r in matches]
-        all_obj_keys = _cb_chunk_major_object_keys(key, all_hashes, read.blend_gids)
+        all_obj_keys = _cb_chunk_major_object_keys(
+            key,
+            all_hashes,
+            read.blend_gids,
+            resolve_object_key_fingerprint(self._ctx, key.model_name, key.world_size),
+        )
         per_chunk = len(all_obj_keys) // len(all_hashes) if all_hashes else 0
         for i, h in enumerate(all_hashes):
             per_hash_obj_keys[h] = all_obj_keys[i * per_chunk : (i + 1) * per_chunk]
@@ -365,7 +371,12 @@ class LookupMixin:
         num_kv_readers = key.require_num_kv_readers()
         # PREFIX leg reads attention + recurrent, never aux. Chunk-major so
         # the fold stays prefix-aligned with _poll_prefix_leg's divisor.
-        obj_keys = _cb_chunk_major_object_keys(key, chunk_hashes, read.prefix_gids)
+        obj_keys = _cb_chunk_major_object_keys(
+            key,
+            chunk_hashes,
+            read.prefix_gids,
+            resolve_object_key_fingerprint(self._ctx, key.model_name, key.world_size),
+        )
         prefix_desc = _narrow_attn_desc(attn_desc, read.prefix_gids)
         session = self._ctx.session_manager.get_or_create(rid)
         session.set_tokens(list(key.token_ids))

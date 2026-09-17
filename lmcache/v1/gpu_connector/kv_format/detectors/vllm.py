@@ -145,9 +145,12 @@ def resolve_vllm_kv_layout(
         ``BLNHC``).
 
     Raises:
-        NotImplementedError: If the hint names a heads-outermost vLLM layout
-            LMCache cannot transfer.
-        ValueError: If the hint names an unknown layout.
+        ValueError: If the hint names a heads-outermost vLLM layout LMCache
+            cannot transfer, or any other unknown layout. ``detect_format``
+            documents ``ValueError`` as the failure mode of this layer; the
+            adapter boundary (``translate_vllm_kv_cache_layout``) already
+            raises ``NotImplementedError`` for heads-outermost names before a
+            hint can reach here.
     """
     kv_layout = layout_hints.get("kv_layout")
     if kv_layout is None:
@@ -163,7 +166,7 @@ def resolve_vllm_kv_layout(
         )
         return legacy
     if kv_layout in _HEADS_OUTERMOST_LAYOUTS:
-        raise NotImplementedError(
+        raise ValueError(
             f"vLLM declared KV cache layout {kv_layout!r}, which LMCache "
             "cannot transfer: the head axis is outer to the per-block token "
             "run, so each (layer, block) is fragmented per head. Select a "

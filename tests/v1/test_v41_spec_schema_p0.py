@@ -23,6 +23,9 @@
   之前通过 ``sys.modules`` 注入最小 stand-in（沿用
   ``tests/v1/test_vllm_kv_layout_discovery.py`` 的既有模式）。若环境里真有
   vLLM / torch / 已编译的 ``lmcache_native``，则直接使用真实模块，不注入。
+  注入被限制在一个 ``pytest.MonkeyPatch.context()`` 作用域内，目标模块导入
+  完成后立即从 ``sys.modules`` 回滚，绝不泄漏到会话级——否则假 ``vllm`` 会
+  让其它依赖 ``pytest.importorskip("vllm")`` 的测试误跑并失败。
 - 所有断言都只做纯 Python 读取，不触碰 CUDA 张量。
 
 真实取值回归（任务要求 c）：V4.1 主 MLA spec
@@ -46,25 +49,43 @@ import pytest
 # --------------------------------------------------------------------------
 # no-vLLM 引导：在 import ``kv_cache_group_edits`` 之前，确保 ``vllm`` /
 # ``torch`` / ``lmcache_native`` 可解析（真实可用则用真实的）。
+#
+# 注入必须是**局部且可回滚**的：stub 只活在下面那一个
+# ``pytest.MonkeyPatch.context()`` 块内，目标模块导入完成后立刻从
+# ``sys.modules`` 移除。否则会话级残留的假 ``vllm`` 会让其它本该
+# ``importorskip`` 跳过的 vLLM 测试跑起来并失败（回归 1+2）。
 # --------------------------------------------------------------------------
 
 
-def _register_module(module: ModuleType) -> None:
-    """把 ``module`` 及其父包注册进 ``sys.modules``（供 import 解析用）。"""
+def _register_stub(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> None:
+    """把 ``module``（及其缺失的父包）临时注册进 ``sys.modules``。
+
+    只补 ``sys.modules`` 里**尚不存在**的父包，避免用空 ``ModuleType`` 覆盖
+    真实包（例如 ``lmcache.*`` 的父包）；退出 ``monkeypatch`` 上下文时写入的
+    每一项都会自动回滚。
+
+    Args:
+        monkeypatch: 记录写入、并在上下文退出时回滚的 pytest 补丁器。
+        module: 要注册的 stub 模块；``__name__`` 为完整点分名。
+    """
     parts = module.__name__.split(".")
     for i in range(1, len(parts)):
         parent = ".".join(parts[:i])
-        sys.modules.setdefault(parent, ModuleType(parent))
-    sys.modules[module.__name__] = module
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, ModuleType(parent))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
-def _stub_torch_if_missing() -> None:
+def _stub_torch_if_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """torch 缺失时注入最小但足以 import 的 stand-in。
 
     真实 ``lmcache`` 包的导入链在模块层就会引用 dtype 常量与类型对象
     （``lmcache/utils.py`` 的 ``TORCH_DTYPE_TO_STR_DTYPE`` 与
     ``DiskCacheMetadata`` 注解），所以 stub 需要提供这些名字；具体函数体
     (kernel 等) 不会被本测试触达。若环境里真有 torch 则直接用真实的。
+
+    Args:
+        monkeypatch: 用于注册（并在作用域结束时移除）stub 的补丁器。
     """
     try:
         import torch  # noqa: F401
@@ -108,15 +129,18 @@ def _stub_torch_if_missing() -> None:
         stub.tensor = lambda *args, **kwargs: object()
         stub.frombuffer = lambda *args, **kwargs: object()
         stub._dynamo = ModuleType("torch._dynamo")
-        _register_module(stub)
+        _register_stub(monkeypatch, stub)
 
 
-def _stub_vllm_if_missing() -> None:
+def _stub_vllm_if_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """vLLM 缺失时注入 ``vllm.v1.kv_cache_interface`` 的最小 stand-in。
 
     ``kv_cache_group_edits`` 在模块层从它 import 四个名字；本文件只调用
     ``_declares_slot_compression``（不调用 ``get_kv_cache_spec_kind`` 等），
     所以占位实现足够。
+
+    Args:
+        monkeypatch: 用于注册（并在作用域结束时移除）stub 的补丁器。
     """
     try:
         import vllm  # noqa: F401
@@ -133,42 +157,52 @@ def _stub_vllm_if_missing() -> None:
         stub.KVCacheSpec = object
         stub.KVCacheSpecKind = KVCacheSpecKind
         stub.get_kv_cache_spec_kind = lambda spec: None
-        _register_module(stub)
+        _register_stub(monkeypatch, stub)
 
 
-def _stub_gpu_connector_utils_if_missing() -> None:
+def _stub_gpu_connector_utils_if_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """``lmcache_native`` 未编译时，为 ``kv_cache_group_edits`` 的
     ``from lmcache.v1.gpu_connector.utils import LayoutHints`` 注入占位模块。
 
     只有真实模块 import 失败（原生未编译）才注入；此时该模块本来谁都 import
-    不了，注入不会污染任何真实代码路径。
+    不了，注入不会污染任何真实代码路径，且退出作用域即移除。
+
+    Args:
+        monkeypatch: 用于注册（并在作用域结束时移除）stub 的补丁器。
     """
     try:
         from lmcache.v1.gpu_connector.utils import LayoutHints  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         stub = ModuleType("lmcache.v1.gpu_connector.utils")
         stub.LayoutHints = dict  # TypedDict；读取侧只当 Mapping 用
-        _register_module(stub)
+        _register_stub(monkeypatch, stub)
 
 
-def _ensure_no_vllm_bootstrap() -> None:
-    """只在本环境缺少依赖时注入 stand-in；幂等。"""
-    _stub_torch_if_missing()
-    _stub_vllm_if_missing()
-    _stub_gpu_connector_utils_if_missing()
+def _ensure_no_vllm_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只在本环境缺少依赖时注入 stand-in；幂等。
+
+    Args:
+        monkeypatch: 用于注册（并在作用域结束时移除）stub 的补丁器。
+    """
+    _stub_torch_if_missing(monkeypatch)
+    _stub_vllm_if_missing(monkeypatch)
+    _stub_gpu_connector_utils_if_missing(monkeypatch)
 
 
-_ensure_no_vllm_bootstrap()
+with pytest.MonkeyPatch.context() as _stub_env:
+    # stub 只在 import 期间存在于 ``sys.modules``；块退出后立即回滚，
+    # 不泄漏到 pytest 会话的其它测试（回归 1+2 的修复点）。
+    _ensure_no_vllm_bootstrap(_stub_env)
 
-# First Party
-from lmcache.integration.vllm.kv_cache_group_edits import (  # noqa: E402
-    _declares_slot_compression,
-)
-from lmcache.integration.vllm.kv_cache_groups import (  # noqa: E402
-    read_v41_spec_fields,
-    resolve_tokens_per_state,
-)
-from lmcache.integration.vllm.utils import translate_vllm_kv_cache_layout  # noqa: E402
+    # First Party
+    from lmcache.integration.vllm.kv_cache_group_edits import (
+        _declares_slot_compression,
+    )
+    from lmcache.integration.vllm.kv_cache_groups import (
+        read_v41_spec_fields,
+        resolve_tokens_per_state,
+    )
+    from lmcache.integration.vllm.utils import translate_vllm_kv_cache_layout
 
 # --------------------------------------------------------------------------
 # duck-typed spec stub：按真实 vLLM 类形状构造

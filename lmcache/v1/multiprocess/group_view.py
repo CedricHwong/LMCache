@@ -169,10 +169,22 @@ def num_engine_group_infos(groups: Sequence[EngineGroupInfo]) -> int:
     return len(groups)
 
 
-def _engine_group_id_per_view(
+def engine_group_ids_per_view(
     groups: Sequence[EngineGroupInfo],
 ) -> tuple[int, ...]:
     """Return, per LMCache group, the engine group it draws block IDs from.
+
+    This is the **only** bridge between the two index spaces of this module:
+
+    * the LMCache protocol order (``EngineGroupInfo`` list position), used by
+      :attr:`GroupBlockMask.group_idx` and the runtime kernel-group order; and
+    * the engine group id (``EngineGroupInfo.engine_group_id``), used to key
+      the engine-side block-id lists that :func:`slice_block_ids_per_group`
+      slices and that :func:`expand_engine_block_ids` re-indexes.
+
+    The mapping is many-to-one: several LMCache groups may share one
+    ``engine_group_id`` when one engine group is split by transfer identity,
+    so ``GroupBlockMask.group_idx`` must never be used as an engine group id.
 
     Args:
         groups: The LMCache KV groups, in protocol order.
@@ -186,6 +198,20 @@ def _engine_group_id_per_view(
     if not groups:
         return (0,)
     return tuple(group.engine_group_id for group in groups)
+
+
+def _engine_group_id_per_view(
+    groups: Sequence[EngineGroupInfo],
+) -> tuple[int, ...]:
+    """Back-compat alias for :func:`engine_group_ids_per_view`.
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+
+    Returns:
+        See :func:`engine_group_ids_per_view`.
+    """
+    return engine_group_ids_per_view(groups)
 
 
 def engine_group_layer_indices(
@@ -245,7 +271,7 @@ def expand_engine_block_ids(
         per_group = cast("Sequence[Sequence[int]]", engine_side_block_ids)
     return [
         list(per_group[engine_group_id])
-        for engine_group_id in _engine_group_id_per_view(groups)
+        for engine_group_id in engine_group_ids_per_view(groups)
     ]
 
 
@@ -371,7 +397,14 @@ def get_engine_group_indices(
 # ``tokens_per_block`` / ``sw_size_tokens`` / ``tokens_per_state`` /
 # ``prefix_cacheable`` / ``recurrent_state`` — both
 # :class:`EngineGroupInfo` and the runtime ``KernelGroupInfo`` satisfy them.
-# Groups are keyed by protocol order (``group_idx``), not by their own id.
+#
+# Masks are keyed by protocol order (``GroupBlockMask.group_idx``), which is
+# the **LMCache group** index space — not the engine group id space. The two
+# differ whenever one engine group is split into several LMCache groups (V4.1
+# production G8: four LMCache groups share ``engine_group_id=8``), so a mask's
+# engine-side block-id list must be selected through
+# :func:`engine_group_ids_per_view` (or :func:`group_engine_group_id` on a
+# single descriptor), never by using ``group_idx`` as an engine group id.
 
 
 class MaskGroup(Protocol):
@@ -379,10 +412,15 @@ class MaskGroup(Protocol):
 
     Satisfied structurally by both :class:`EngineGroupInfo` (the protocol-
     visible group view) and the runtime ``KernelGroupInfo`` (dataclass
-    instance attributes; its ``engine_group_idx`` is not part of the mask
-    math, which keys groups by protocol order instead), so the mask
-    computation is engine-neutral and shared by the connector and the server.
-    Not intended for ``isinstance`` checks.
+    instance attributes), so the mask computation is engine-neutral and
+    shared by the connector and the server.  Not intended for ``isinstance``
+    checks.
+
+    The engine group a descriptor draws block IDs from is deliberately *not*
+    part of this structural match: the two classes name it differently
+    (``EngineGroupInfo.engine_group_id`` vs ``KernelGroupInfo.engine_group_idx``).
+    :func:`group_engine_group_id` reads either name and is what
+    :class:`GroupBlockMask` records, so mask consumers never have to guess.
     """
 
     tokens_per_block: int
@@ -390,6 +428,38 @@ class MaskGroup(Protocol):
     tokens_per_state: int
     prefix_cacheable: bool
     recurrent_state: bool
+
+
+def group_engine_group_id(group: MaskGroup) -> int | None:
+    """Return the engine group id a mask-group descriptor draws block IDs from.
+
+    The engine group id selects which engine-side block-id list (the space of
+    :func:`slice_block_ids_per_group` and of the ``STORE``/``RETRIEVE``
+    protocol *before* :func:`expand_engine_block_ids`) the group's blocks index
+    into.  It is a *different* index space from the LMCache protocol order that
+    :attr:`GroupBlockMask.group_idx` uses, and several LMCache groups may share
+    one engine group id.
+
+    Descriptors name it differently: :class:`EngineGroupInfo` exposes
+    ``engine_group_id`` and the runtime ``KernelGroupInfo`` exposes
+    ``engine_group_idx``; either is accepted.
+
+    Args:
+        group: One mask group descriptor.
+
+    Returns:
+        The engine group id, or ``None`` when the descriptor reports neither
+        attribute (an engine without group metadata — the single non-hybrid
+        engine group ``0``).  ``None`` is never a valid engine group id, so
+        callers must treat it as "block IDs are not group-addressable" rather
+        than falling back to ``group_idx``.
+    """
+    value = getattr(group, "engine_group_id", None)
+    if value is None:
+        value = getattr(group, "engine_group_idx", None)
+    if value is None:
+        return None
+    return int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,8 +475,11 @@ class GroupBlockMask:
     """
 
     group_idx: int
-    """LMCache group index in protocol order (same index space as
-    ``slice_block_ids_per_group``)."""
+    """LMCache group index in protocol order (the ``EngineGroupInfo``
+    list position). This is the index into the mask list itself, **not** an
+    engine group id: :attr:`engine_group_id` names the engine-side block-id
+    list this mask's block indices belong to. The two coincide only when every
+    LMCache group has its own engine group (no split)."""
     tokens_per_block: int
     """Logical tokens covered by one engine block of this group (its own
     block grid)."""
@@ -417,6 +490,15 @@ class GroupBlockMask:
     blocks: tuple[bool, ...] | None
     """Per-block flag over ``[start_block, end_block)``; ``None`` = all True
     (full-attention sentinel)."""
+    engine_group_id: int | None = None
+    """Engine group id whose block-id list these block indices index into
+    (the :func:`slice_block_ids_per_group` space). A mask consumer that has
+    engine-side block tables indexed by engine group id must select
+    ``engine_side_block_ids[self.engine_group_id]`` — using
+    ``self.group_idx`` is only correct when the two spaces happen to be equal.
+    ``None`` when the source descriptor reports no engine group id (single
+    non-hybrid group); the default keeps positional construction
+    back-compatible."""
 
     @property
     def block_count(self) -> int:
@@ -631,19 +713,32 @@ def _mask_for_group(
 
     Returns:
         The group's block mask.  Excluded groups yield an explicit all-False
-        mask so callers can round-trip the group count.
+        mask so callers can round-trip the group count.  The mask records the
+        descriptor's engine group id (see :func:`group_engine_group_id`) so
+        consumers pair it with the right engine-side block-id list.
     """
     tpb = group.tokens_per_block
     start_block, end_block = _group_block_range(tpb, token_len, start_token)
     block_count = end_block - start_block
+    engine_group_id = group_engine_group_id(group)
 
     if exclude_non_cacheable and not group.prefix_cacheable:
         return GroupBlockMask(
-            group_idx, tpb, start_block, end_block, (False,) * block_count
+            group_idx,
+            tpb,
+            start_block,
+            end_block,
+            (False,) * block_count,
+            engine_group_id=engine_group_id,
         )
     if exclude_recurrent and group.recurrent_state:
         return GroupBlockMask(
-            group_idx, tpb, start_block, end_block, (False,) * block_count
+            group_idx,
+            tpb,
+            start_block,
+            end_block,
+            (False,) * block_count,
+            engine_group_id=engine_group_id,
         )
     window_tokens = group.sw_size_tokens
     if window_tokens >= 0:
@@ -661,9 +756,17 @@ def _mask_for_group(
             start_block,
             end_block,
             None if blocks is None else tuple(blocks),
+            engine_group_id=engine_group_id,
         )
     # Full attention: all-True sentinel.
-    return GroupBlockMask(group_idx, tpb, start_block, end_block, None)
+    return GroupBlockMask(
+        group_idx,
+        tpb,
+        start_block,
+        end_block,
+        None,
+        engine_group_id=engine_group_id,
+    )
 
 
 def compute_group_store_masks(
@@ -701,7 +804,10 @@ def compute_group_store_masks(
         use_eagle: Reserve the EAGLE peek block in the window tail mask.
 
     Returns:
-        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+        One :class:`GroupBlockMask` per LMCache group, in protocol order; each
+        carries the descriptor's ``engine_group_id`` (see
+        :func:`group_engine_group_id`) so its block indices can be paired with
+        the right engine-side block-id list.
 
     Raises:
         ValueError: If ``token_len`` is not aligned to the cross-group lcm of
@@ -758,7 +864,10 @@ def compute_group_lookup_masks(
         exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
 
     Returns:
-        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+        One :class:`GroupBlockMask` per LMCache group, in protocol order; each
+        carries the descriptor's ``engine_group_id`` (see
+        :func:`group_engine_group_id`) so its block indices can be paired with
+        the right engine-side block-id list.
 
     Raises:
         ValueError: If ``token_len`` is not aligned to the cross-group lcm.
@@ -809,7 +918,10 @@ def compute_group_load_masks(
         exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
 
     Returns:
-        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+        One :class:`GroupBlockMask` per LMCache group, in protocol order; each
+        carries the descriptor's ``engine_group_id`` (see
+        :func:`group_engine_group_id`) so its block indices can be paired with
+        the right engine-side block-id list.
 
     Raises:
         ValueError: If ``hit_length_tokens`` is not aligned to the cross-group

@@ -35,6 +35,7 @@ def resolve_object_keys(
     world_size: int,
     token_ids: list[int],
     cache_salt: str,
+    format_fingerprint: str = "",
 ) -> tuple[list[ObjectKey], int]:
     """Resolve a token sequence to the object keys of its complete chunks.
 
@@ -51,6 +52,11 @@ def resolve_object_keys(
         world_size: Tensor-parallel world size selecting the per-rank fan-out.
         token_ids: The token sequence to resolve.
         cache_salt: Per-tenant isolation salt.
+        format_fingerprint: KV format fingerprint of the engine that
+            registered ``model_name`` on the node this resolves against, or
+            ``""`` when the node fingerprints nothing. It must match what the
+            store path used, or the resolved keys will not match stored
+            objects.
 
     Returns:
         ``(obj_keys, chunk_count)``. ``obj_keys`` holds one key per (chunk, rank)
@@ -79,5 +85,5 @@ def resolve_object_keys(
     chunk_hashes = token_hasher.compute_chunk_hashes(list(token_ids))
     if not chunk_hashes:
         return [], 0
-    obj_keys = ipc_key_to_object_keys(ipc_key, chunk_hashes, [0])[0]
+    obj_keys = ipc_key_to_object_keys(ipc_key, chunk_hashes, [0], format_fingerprint)[0]
     return obj_keys, len(chunk_hashes)

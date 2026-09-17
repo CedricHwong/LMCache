@@ -98,14 +98,23 @@ def _narrow_attn_desc(
 
 
 def _cb_chunk_major_object_keys(
-    key: IPCCacheServerKey, chunk_hashes: list[bytes], gids: tuple[int, ...]
+    key: IPCCacheServerKey,
+    chunk_hashes: list[bytes],
+    gids: tuple[int, ...],
+    format_fingerprint: str = "",
 ) -> list:
     """Expand chunk hashes to object keys, chunk-major.
 
     Per-chunk stride is uniform ``len(gids) * expansion`` so prefix bitmaps
     stay leading-ones-aligned. Returns the flattened key list.
+
+    ``format_fingerprint`` must be the fingerprint of the engine that
+    registered ``key``'s model, so the resolved keys land in that engine's
+    byte-layout namespace (see :mod:`lmcache.v1.kv_format_fingerprint`).
     """
-    per_group = ipc_key_to_object_keys(key, chunk_hashes, list(gids))
+    per_group = ipc_key_to_object_keys(
+        key, chunk_hashes, list(gids), format_fingerprint
+    )
     n_hashes = len(chunk_hashes)
     expansion = len(per_group[0]) // n_hashes if n_hashes else 0
     out: list = []

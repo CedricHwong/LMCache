@@ -36,6 +36,16 @@ Env knobs
   V41_REUSE_VENV=1 Keep the existing ``$REPO_ROOT/.testenv`` without
                    reinstalling dependencies (fast repeat runs).
   V41_NO_PIP=1     Skip dependency installation entirely (assume they exist).
+  V41_TORCH=1      Also install torch in ``stub`` mode.  Required by the
+                   v4.1 phase-1/2 tests: they import
+                   ``lmcache.integration.vllm.utils`` and
+                   ``lmcache.v1.gpu_connector.kv_format`` at module scope, and
+                   that chain needs a real ``torch.nn`` (the in-test torch
+                   stub only covers dtype constants).  A CPU wheel is enough;
+                   no GPU is involved.
+  V41_TORCH_INDEX_URL
+                   pip ``--index-url`` used when installing torch (e.g.
+                   ``https://download.pytorch.org/whl/cpu`` in CI).
   V41_CONFCUTDIR   Override the ``--confcutdir`` passed to pytest (default:
                    ``tests/v1`` when all test paths live under ``tests/v1``).
 DOC
@@ -119,6 +129,17 @@ fi
 RUN_PY="$VENV_PY"
 
 # ---------------------------------------------------------------------------
+# torch install helper: CPU wheels are enough, no GPU is touched.
+# ---------------------------------------------------------------------------
+install_torch() {
+  if [ -n "${V41_TORCH_INDEX_URL:-}" ]; then
+    "$VENV_PY" -m pip install --index-url "$V41_TORCH_INDEX_URL" torch
+  else
+    "$VENV_PY" -m pip install torch
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Install dependencies (skippable for repeat runs).
 # ---------------------------------------------------------------------------
 if [ "${V41_REUSE_VENV:-0}" != "1" ] && [ "${V41_NO_PIP:-0}" != "1" ]; then
@@ -130,7 +151,10 @@ if [ "${V41_REUSE_VENV:-0}" != "1" ] && [ "${V41_NO_PIP:-0}" != "1" ]; then
     "pyzmq>=25" "grpcio>=1.78" "protobuf>=6.31.1,<7"
   if [ "$MODE" = "native" ] || [ "$MODE" = "parity" ]; then
     echo "[env-harness] installing torch (needed to build lmcache_native)"
-    "$VENV_PY" -m pip install torch
+    install_torch
+  elif [ "${V41_TORCH:-0}" = "1" ]; then
+    echo "[env-harness] installing CPU-only torch (V41_TORCH=1)"
+    install_torch
   fi
 fi
 

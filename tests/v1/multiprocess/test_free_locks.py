@@ -440,7 +440,9 @@ def test_server_free_lookup_locks_honors_the_session_lock_model():
 
     with patch(
         "lmcache.v1.multiprocess.modules.lookup.ipc_key_to_object_keys",
-        side_effect=lambda k, hs, gids: [[f"g{gids[0]}-{h.decode()}" for h in hs]],
+        side_effect=lambda k, hs, gids, format_fingerprint="": [
+            [f"g{gids[0]}-{h.decode()}" for h in hs]
+        ],
     ):
         module.free_lookup_locks(key, 1)
 

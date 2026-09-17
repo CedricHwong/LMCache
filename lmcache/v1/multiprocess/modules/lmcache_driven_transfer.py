@@ -19,6 +19,10 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.kv_format_fingerprint import (
+    compute_format_fingerprint,
+    descriptors_from_registration,
+)
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
@@ -520,12 +524,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             for gid in range(num_object_groups)
         }
         attn_desc = kv_groups_manager.get_attn_desc()
+        # Namespace this registration's object keys by its byte layout, so two
+        # deployments sharing one L2 backend with different ``--kv-cache-dtype``
+        # (or block size, page padding, compression, ...) cannot read each
+        # other's caches. The fingerprint is derived from the same descriptors
+        # the transfer kernels use, so it cannot drift from the real layout.
+        format_fingerprint = compute_format_fingerprint(
+            descriptors_from_registration(
+                kv_groups_manager.kernel_groups, engine_group_infos
+            ),
+            world_size=world_size,
+        )
         self._ctx.layout_desc_registry.register(
             model_name,
             world_size,
             layout_desc,
             attn_desc,
             group_layout_descs=group_layout_descs,
+            format_fingerprint=format_fingerprint,
         )
 
         with self._lock:

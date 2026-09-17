@@ -16,6 +16,7 @@ class _FakeKVLayerGroupsManager:
     """Minimal manager stub: one full-attention object group."""
 
     num_object_groups: int = 1
+    kernel_groups: list[Any] = []
 
     def get_attn_desc(self) -> Any:
         """One full-attention object group."""

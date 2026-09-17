@@ -47,6 +47,12 @@ class _LayoutDescEntry:
     order. Defaults to a single full-attention group."""
     group_layout_descs: dict[int, MemoryLayoutDesc] | None = None
     """Per-group layout descriptors, or ``None`` if all share ``layout_desc``."""
+    format_fingerprint: str = ""
+    """KV byte-layout fingerprint of the registration that owns this entry.
+
+    Empty means the engine registered no format metadata (or a single
+    non-GPU context), in which case object keys are not namespaced by
+    layout."""
 
 
 class LayoutDescRegistry:
@@ -71,6 +77,7 @@ class LayoutDescRegistry:
         layout_desc: MemoryLayoutDesc,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         group_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
+        format_fingerprint: str = "",
     ) -> None:
         """Register a layout descriptor for a (model_name, world_size) pair.
 
@@ -87,6 +94,17 @@ class LayoutDescRegistry:
                 (each group is a separate keyed allocation); ``None`` derives
                 one entry per object group in ``attn_desc``, all sharing
                 ``layout_desc``.
+            format_fingerprint: KV byte-layout fingerprint of this
+                registration (see
+                :mod:`lmcache.v1.kv_format_fingerprint`). Concurrent
+                registrations for the same pair must agree on it.
+
+        Raises:
+            ValueError: A different non-empty fingerprint is already
+                registered for this pair. Two layouts for one
+                (model_name, world_size) cannot be namespaced apart, so the
+                ambiguity is rejected instead of silently letting them share
+                a key space.
         """
         key = (model_name, world_size)
         attn_desc = replace(attn_desc, world_size=world_size)
@@ -102,12 +120,28 @@ class LayoutDescRegistry:
                     ref_count=1,
                     attn_desc=attn_desc,
                     group_layout_descs=group_layout_descs,
+                    format_fingerprint=format_fingerprint,
                 )
                 return
+
+            if (
+                entry.format_fingerprint
+                and format_fingerprint
+                and entry.format_fingerprint != format_fingerprint
+            ):
+                raise ValueError(
+                    f"conflicting KV format fingerprints for model "
+                    f"{model_name!r} world size {world_size}: "
+                    f"{entry.format_fingerprint!r} already registered, got "
+                    f"{format_fingerprint!r}. Two byte layouts cannot share "
+                    "one L2 namespace; unregister the old worker first."
+                )
 
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
             entry.group_layout_descs = group_layout_descs
+            if format_fingerprint:
+                entry.format_fingerprint = format_fingerprint
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -157,6 +191,23 @@ class LayoutDescRegistry:
             if entry is None:
                 return None
             return entry.group_layout_descs
+
+    def find_format_fingerprint(self, model_name: str, world_size: int) -> str:
+        """Look up the KV format fingerprint registered for a pair.
+
+        Args:
+            model_name: The model name.
+            world_size: The world size.
+
+        Returns:
+            The format fingerprint registered for the pair, or ``""`` when
+            the pair is unknown or was registered without format metadata.
+        """
+        with self._lock:
+            entry = self._registry.get((model_name, world_size))
+            if entry is None:
+                return ""
+            return entry.format_fingerprint
 
     def find_attn_desc(self, model_name: str, world_size: int) -> AttnWindowDesc:
         """Look up the attention-window descriptor for a pair.
@@ -276,6 +327,26 @@ class MPCacheServerContext:
         """Registry mapping (model_name, world_size) to MemoryLayoutDesc."""
         return self._layout_desc_registry
 
+    def format_fingerprint(self, model_name: str, world_size: int) -> str:
+        """Resolve the KV format fingerprint of a registered model.
+
+        Object keys must be resolved with the fingerprint of the engine that
+        registered the model, so every store and lookup path reads it through
+        this single accessor.
+
+        Args:
+            model_name: The model name.
+            world_size: The world size.
+
+        Returns:
+            The registered format fingerprint, or ``""`` when the model is
+            not registered on this server (or was registered without format
+            metadata).
+        """
+        return self._layout_desc_registry.find_format_fingerprint(
+            model_name, world_size
+        )
+
     def resolve_obj_keys(
         self, key: IPCCacheServerKey, object_group_ids: list[int]
     ) -> list[list[ObjectKey]]:
@@ -290,7 +361,8 @@ class MPCacheServerContext:
 
         Returns:
             The i-th element is the list of ObjectKeys for
-            ``object_group_ids[i]``.
+            ``object_group_ids[i]``, namespaced by the registered model's KV
+            format fingerprint.
 
         Raises:
             ValueError: If ``key.worker_id`` is ``None``.
@@ -304,7 +376,12 @@ class MPCacheServerContext:
         ]
         if key.worker_id is None:
             raise ValueError("Must resolve keys with worker_id != None")
-        return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
+        return ipc_key_to_object_keys(
+            key,
+            chunk_hashes,
+            object_group_ids,
+            self.format_fingerprint(key.model_name, key.world_size),
+        )
 
     @staticmethod
     def _compute_shm_pool_info(
