@@ -260,7 +260,16 @@ def test_server_store_and_retrieve_delegate_event_ordering(
         "get_and_touch_context_entry",
         lambda instance_id: entry,
     )
-    key = SimpleNamespace(request_id="request", cache_salt="", worker_id=0)
+    # A real IPCCacheServerKey always carries the token range; the store path
+    # clamps ``end`` to the accepted prefix, which reads ``token_ids``.
+    key = SimpleNamespace(
+        request_id="request",
+        cache_salt="",
+        worker_id=0,
+        token_ids=(),
+        start=0,
+        end=0,
+    )
 
     assert module.store(key, 1, [[]], b"store-producer") == (
         b"completion-handle",

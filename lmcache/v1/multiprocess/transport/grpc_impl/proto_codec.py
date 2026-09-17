@@ -7,7 +7,7 @@ non-structural message conversions are supplied by service codec modules.
 """
 
 # Standard
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from typing import (
     Any,
     Callable,
@@ -31,6 +31,7 @@ from lmcache.v1.multiprocess.transport.grpc_impl.codecs import (
 )
 
 _NONE_TYPE = type(None)
+_NO_PY_DEFAULT: Any = object()
 
 ValueEncoder = Callable[[Any], Any]
 ValueDecoder = Callable[[Any], Any]
@@ -93,6 +94,40 @@ def _structured_fields(py_type: Any) -> tuple[tuple[str, Any], ...] | None:
     if issubclass(py_type, msgspec.Struct):
         return tuple((name, hints.get(name, Any)) for name in py_type.__struct_fields__)
     return None
+
+
+def _structured_defaults(py_type: Any) -> dict[str, Any]:
+    """Return the declared field defaults of a structural Python type.
+
+    Used to restore a Python default when a presence-tracking proto field is
+    *absent from the wire* — e.g. a payload produced by an older build that
+    predates an appended field. A proto3 default (``0`` / ``""`` / ``False``)
+    is not necessarily the Python default, so reading it raw would silently
+    change semantics.
+
+    Args:
+        py_type: A dataclass or ``msgspec.Struct`` type.
+
+    Returns:
+        Field name -> default value for every field with an explicit
+        ``default`` (dataclass ``default_factory`` values are not consulted,
+        since a shared mutable default must not be returned). Empty for
+        non-structural or defaultless types.
+    """
+    py_type, _ = _unwrap_optional(py_type)
+    if not isinstance(py_type, type):
+        return {}
+    if is_dataclass(py_type):
+        return {
+            field.name: field.default
+            for field in fields(py_type)
+            if field.init and field.default is not MISSING
+        }
+    if issubclass(py_type, msgspec.Struct):
+        names = py_type.__struct_fields__
+        defaults = py_type.__struct_defaults__
+        return dict(zip(names[len(names) - len(defaults) :], defaults, strict=True))
+    return {}
 
 
 def _is_map_field(field: Any) -> bool:
@@ -196,7 +231,9 @@ def _compile_map_field(field: Any, py_type: Any) -> tuple[FieldWriter, FieldRead
     return write_message_map, read_message_map
 
 
-def _compile_field_codec(field: Any, py_type: Any) -> tuple[FieldWriter, FieldReader]:
+def _compile_field_codec(
+    field: Any, py_type: Any, py_default: Any = _NO_PY_DEFAULT
+) -> tuple[FieldWriter, FieldReader]:
     py_type, optional = _unwrap_optional(py_type)
     if optional and (field.is_repeated or not field.has_presence):
         raise TypeError(
@@ -266,7 +303,20 @@ def _compile_field_codec(field: Any, py_type: Any) -> tuple[FieldWriter, FieldRe
         writer, reader = write_scalar, read_scalar
 
     if not optional:
-        return writer, reader
+        if py_default is _NO_PY_DEFAULT or not field.has_presence:
+            return writer, reader
+
+        field_name = field.name
+
+        def read_defaulted(message: Any) -> Any:
+            # A presence-tracking field that is absent from the wire (e.g. a
+            # payload from a build that predates an appended field) must fall
+            # back to the Python default, not the proto3 default.
+            if not message.HasField(field_name):
+                return py_default
+            return reader(message)
+
+        return writer, read_defaulted
 
     field_name = field.name
 
@@ -324,13 +374,16 @@ def _compile_message_codec(
         )
 
     struct_codecs: list[tuple[str, FieldWriter, FieldReader]] = []
+    py_defaults = _structured_defaults(py_type)
     for (name, field_type), field in zip(py_fields, proto_fields, strict=True):
         if field.name not in (name, f"encoded_{name}"):
             raise TypeError(
                 f"{py_type.__name__}.{name} does not match "
                 f"{descriptor.full_name}.{field.name}"
             )
-        writer, reader = _compile_field_codec(field, field_type)
+        writer, reader = _compile_field_codec(
+            field, field_type, py_defaults.get(name, _NO_PY_DEFAULT)
+        )
         struct_codecs.append((name, writer, reader))
 
     def write_struct(message: Any, value: Any) -> None:

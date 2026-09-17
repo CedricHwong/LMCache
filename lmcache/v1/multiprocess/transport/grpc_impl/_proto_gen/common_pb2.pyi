@@ -5,8 +5,8 @@
 from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Iterable as _Iterable
-from typing import ClassVar as _ClassVar, Optional as _Optional
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -54,18 +54,42 @@ class DeviceIpcWrapper(_message.Message):
     pickled_payload: bytes
     def __init__(self, pickled_payload: _Optional[bytes] = ...) -> None: ...
 
+class TokensPerState(_message.Message):
+    __slots__ = ("numerator", "denominator")
+    NUMERATOR_FIELD_NUMBER: _ClassVar[int]
+    DENOMINATOR_FIELD_NUMBER: _ClassVar[int]
+    numerator: int
+    denominator: int
+    def __init__(self, numerator: _Optional[int] = ..., denominator: _Optional[int] = ...) -> None: ...
+
 class EngineGroupInfo(_message.Message):
-    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state")
+    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state", "tokens_per_state", "cache_role", "state_content_bytes", "block_stride_alignment", "is_index_group_leader", "prefix_cacheable", "page_size_padded", "num_head_slots")
     ENGINE_GROUP_ID_FIELD_NUMBER: _ClassVar[int]
     LAYER_INDICES_FIELD_NUMBER: _ClassVar[int]
     TOKENS_PER_BLOCK_FIELD_NUMBER: _ClassVar[int]
     SW_SIZE_TOKENS_FIELD_NUMBER: _ClassVar[int]
     EXTRA_OBJECT_GROUP_TAG_FIELD_NUMBER: _ClassVar[int]
     RECURRENT_STATE_FIELD_NUMBER: _ClassVar[int]
+    TOKENS_PER_STATE_FIELD_NUMBER: _ClassVar[int]
+    CACHE_ROLE_FIELD_NUMBER: _ClassVar[int]
+    STATE_CONTENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    BLOCK_STRIDE_ALIGNMENT_FIELD_NUMBER: _ClassVar[int]
+    IS_INDEX_GROUP_LEADER_FIELD_NUMBER: _ClassVar[int]
+    PREFIX_CACHEABLE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_PADDED_FIELD_NUMBER: _ClassVar[int]
+    NUM_HEAD_SLOTS_FIELD_NUMBER: _ClassVar[int]
     engine_group_id: int
     layer_indices: _containers.RepeatedScalarFieldContainer[int]
     tokens_per_block: int
     sw_size_tokens: int
     extra_object_group_tag: int
     recurrent_state: bool
-    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ...) -> None: ...
+    tokens_per_state: TokensPerState
+    cache_role: str
+    state_content_bytes: int
+    block_stride_alignment: int
+    is_index_group_leader: bool
+    prefix_cacheable: bool
+    page_size_padded: int
+    num_head_slots: int
+    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ..., tokens_per_state: _Optional[_Union[TokensPerState, _Mapping]] = ..., cache_role: _Optional[str] = ..., state_content_bytes: _Optional[int] = ..., block_stride_alignment: _Optional[int] = ..., is_index_group_leader: bool = ..., prefix_cacheable: bool = ..., page_size_padded: _Optional[int] = ..., num_head_slots: _Optional[int] = ...) -> None: ...

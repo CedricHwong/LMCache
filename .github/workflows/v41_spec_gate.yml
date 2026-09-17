@@ -38,6 +38,9 @@ on:
       - "lmcache/v1/gpu_connector/kv_format/**"
       - "lmcache/v1/kv_layer_groups.py"
       - "lmcache/v1/multiprocess/group_view.py"
+      - "lmcache/v1/multiprocess/transport/grpc_impl/protos/**"
+      - "lmcache/v1/multiprocess/transport/grpc_impl/proto_codec.py"
+      - "lmcache/v1/multiprocess/transport/grpc_impl/codecs/**"
       - "tests/v1/test_v41_*.py"
       - "tests/v1/test_per_group_masks.py"
       - "tests/v1/test_kv_cache_groups.py"
@@ -132,6 +135,7 @@ jobs:
           bash scripts/v41_test_env.sh stub -- \
             tests/v1/test_v41_spec_schema_p0.py \
             tests/v1/test_v41_semantics_phase2.py \
+            tests/v1/test_v41_engine_group_proto_alignment.py \
             tests/v1/test_per_group_masks.py \
             tests/v1/test_kv_cache_groups.py \
             tests/v1/gpu_connector/test_v41_cs_nh1_regression.py

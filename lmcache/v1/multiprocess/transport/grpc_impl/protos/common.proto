@@ -36,7 +36,30 @@ message DeviceIpcWrapper {
   bytes pickled_payload = 1;
 }
 
+// Lossless rational carrier for ``EngineGroupInfo.tokens_per_state``.
+//
+// The Python field is annotated ``int`` and every *engine-produced* value is
+// an integer (the vLLM reader rejects ``Fraction`` at the engine boundary:
+// lmcache/integration/vllm/kv_cache_groups.py::resolve_tokens_per_state), but
+// LMCache's in-process mask math deliberately supports exact fractional
+// values (see the ``Fraction(3, 2)`` regression in
+// tests/v1/test_v41_semantics_phase2.py).  A plain ``int64`` would silently
+// truncate such a value (``Fraction(1, 2)`` encodes as ``0``), so the wire
+// carries the exact numerator/denominator instead.  An absent/legacy payload
+// has ``denominator == 0`` and decodes to the Python default ``1``.
+message TokensPerState {
+  int64 numerator = 1;
+  int64 denominator = 2;
+}
+
 // EngineGroupInfo mirrors the Python msgspec.Struct field-by-field.
+//
+// The Python structural codec (proto_codec._compile_message_codec) zips
+// struct fields with proto fields *positionally* and requires the counts to
+// match, so this message must be kept in exact lockstep with
+// lmcache/v1/multiprocess/group_view.py::EngineGroupInfo. Fields are only
+// ever *appended*: numbers 1-6 are the released layout and must not be
+// renumbered, reused, or reordered.
 message EngineGroupInfo {
   int64 engine_group_id = 1;
   repeated int64 layer_indices = 2;
@@ -44,4 +67,17 @@ message EngineGroupInfo {
   int64 sw_size_tokens = 4;
   int64 extra_object_group_tag = 5;
   bool recurrent_state = 6;
+
+  // DeepSeek V4.1 tail, appended in lockstep with the struct's appended
+  // fields. All of them are defaulted/fault-tolerant on the Python side, so
+  // an old payload decodes to the contract defaults and unknown fields are
+  // ignored by old protobuf consumers.
+  TokensPerState tokens_per_state = 7;
+  optional string cache_role = 8;
+  optional int64 state_content_bytes = 9;
+  optional int64 block_stride_alignment = 10;
+  bool is_index_group_leader = 11;
+  optional bool prefix_cacheable = 12;
+  optional int64 page_size_padded = 13;
+  optional int64 num_head_slots = 14;
 }
