@@ -9,11 +9,22 @@ layout once in the engine core (``KVCacheLayout``, see
 truth for which :class:`EngineKVFormat` a per-layer cache has. Byte geometry
 (sizes, strides) is used only to *assert* the declaration matches the
 registered tensors, never to pick the format, and every fallback path warns.
+
+One cache is *not* transferable even though its bytes look like a valid pool:
+the DeepSeek-V4.1 compressor circular-buffer ring (``CircularBufferSpec``).
+Its per-layer tensor is shape-indistinguishable from a compressed-MLA pool, so
+detection alone can never tell it apart -- only the vLLM *spec* declares it
+non-cacheable (``prefix_cacheable=False``, ``uses_slot_mapping=False``). The
+recognition predicate :func:`is_circular_buffer_ring_spec` below is the
+single version-tolerant place that reads that declaration; the vLLM group
+builders use it to exclude the ring group from LMCache KV groups up-front (see
+``lmcache.integration.vllm.kv_cache_groups``) so it is never silently stored
+as if it were request-reusable prefix KV.
 """
 
 # mypy: disable-error-code="union-attr"
 # Standard
-from typing import Optional
+from typing import Any, Optional
 
 # Third Party
 import torch
@@ -48,6 +59,68 @@ _HEADS_OUTERMOST_LAYOUTS = frozenset(("LHBNC", "BHLNC"))
 # buffer per cache group whose per-layer 4-D views carry the block step in
 # stride(0). Any non-4-D per-layer structure contradicts the declaration.
 _BLOCKS_FIRST_LAYOUTS = frozenset(("BLHNC", "BLNHC"))
+
+
+def _is_circular_buffer_ring_class(spec: Any) -> bool:
+    """Return whether a vLLM KV cache spec is a ``CircularBufferSpec``.
+
+    Checked by class name so this module stays importable without vLLM (the
+    same convention the vLLM group builder uses for sliding-window / Mamba
+    specs). ``CircularBufferSpec`` overrides ``prefix_cacheable`` to always
+    return ``False`` and ``uses_slot_mapping`` to ``False``, so the class
+    identity *is* the declaration; seeing the class but a truthy flag would be
+    a contradiction this module cannot guess around, so it fails closed.
+    """
+    if not any(cls.__name__ == "CircularBufferSpec" for cls in type(spec).__mro__):
+        return False
+    prefix_cacheable = getattr(spec, "prefix_cacheable", None)
+    uses_slot_mapping = getattr(spec, "uses_slot_mapping", None)
+    if prefix_cacheable is True or uses_slot_mapping is True:
+        raise ValueError(
+            "vLLM CircularBufferSpec must declare prefix_cacheable=False and "
+            "uses_slot_mapping=False; got prefix_cacheable="
+            f"{prefix_cacheable!r}, uses_slot_mapping={uses_slot_mapping!r}. "
+            "Refusing to guess whether the compressor ring is cacheable."
+        )
+    return True
+
+
+def is_circular_buffer_ring_spec(spec: Any) -> bool:
+    """Return whether a vLLM KV cache spec is the compressor circular-buffer ring.
+
+    The ring is DeepSeek-V4.1's per-request scratch: one block per request
+    holds the raw ``[kv, score]`` rows of the token group still being
+    compressed (``CircularBufferSpec``, block size = the ring capacity). vLLM
+    itself declares it ``prefix_cacheable=False`` and ``uses_slot_mapping=
+    False`` -- its content is a deterministic function of neither the prefix nor
+    the position alone (speculative drafts are written then rolled back, and
+    the ring slots are addressed as ``block * capacity + pos % capacity``), so
+    it is never reusable prefix KV and must be excluded from LMCache KV groups.
+    Its bytes are shape-indistinguishable from a compressed-MLA pool, which is
+    why detection cannot -- and must not -- classify it from the tensors.
+
+    Handles a ``UniformTypeKVCacheSpecs`` wrapper too: a group whose every
+    leaf is the ring is a ring group. A mixed wrapper (ring beside regular
+    pools) must not count, or the whole group would be wrongly excluded.
+
+    Args:
+        spec: A vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``),
+            or ``None``.
+
+    Returns:
+        ``True`` only for a compressor ring spec.
+
+    Raises:
+        ValueError: If a ``CircularBufferSpec`` declares itself cacheable.
+    """
+    if spec is None:
+        return False
+    leaves = getattr(spec, "kv_cache_specs", None)
+    if isinstance(leaves, dict):
+        return bool(leaves) and all(
+            _is_circular_buffer_ring_class(leaf) for leaf in leaves.values()
+        )
+    return _is_circular_buffer_ring_class(spec)
 
 
 def resolve_vllm_kv_layout(

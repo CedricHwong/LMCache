@@ -681,6 +681,73 @@ def make_page_buffer_shape_desc(
     return desc
 
 
+# DeepSeek V4.1 DSA indexer K row: identification & geometry.
+# The indexer K cache is a per-token quantized record of fixed byte width
+# derived from ``index_head_dim`` (vLLM ``_indexer_k_cache_head_dim``,
+# ``models/deepseek_v41/attention.py:87-95``):
+#   * fp8 path   (default): ``index_head_dim``(128) value bytes + one 4-byte
+#     fp32 scale = 132 B; the only path on SM90/H100.
+#   * MXFP4 path          : ``index_head_dim//2``(64) packed value bytes + 4
+#     ue8m0 block scales = 68 B; Blackwell only.
+# The V4.1 indexer spec does **not** set ``cache_role`` / ``is_index_group_leader``
+# (both left at the MLA defaults), so those ``EngineGroupInfo`` fields cannot
+# identify it; the row signature below (uint8 dtype + fixed width) is the
+# evaluable discriminator. The engine-side KV page layout behind it is the
+# segregated ``[BS x vals][BS x scale]`` of ``NL_X_NB_BSV_BSS`` (its
+# ``NL_X_NB_BSV_BSS_Spec`` also decomposes a row as ``(vals, scale)``), which
+# the device kernels already treat generically as ``(vals, scale) = (W - 4, 4)``
+# bytes.
+_INDEXER_ROW_WIDTHS = frozenset((132, 68))
+"""DSA indexer K row widths in bytes (fp8 128+4, MXFP4 64+4) for the default
+``index_head_dim == 128``; extend if a model uses another ``index_head_dim``."""
+_INDEXER_SCALE_BYTES = 4
+"""Scale bytes per indexer row: one 4-byte unit per token on both paths."""
+
+
+def is_indexer_k_row(row_bytes: int, dtype: torch.dtype) -> bool:
+    """Return whether a per-layer KV row is a V4.1 DSA indexer K record.
+
+    The indexer K cache is the only ``uint8`` paged cache whose row width is
+    the fixed ``index_head_dim``-derived record (132 / 68 B); the model-side
+    neighbours -- the fp8_ds_mla main/SWA records (584 B, or 528 B MXFP8 on
+    SM100), the NVFP4 compressed record (288 B) and the fp32 compressor ring
+    (``row_bytes >= 4096``) -- never match (dtype or width).
+
+    Args:
+        row_bytes: Trailing content width of the per-layer tensor
+            (``shape[-1]`` / ``desc.hs``).
+        dtype: The per-layer tensor dtype.
+
+    Returns:
+        Whether ``(dtype, row_bytes)`` is a DSA indexer K row.
+    """
+    return dtype == torch.uint8 and int(row_bytes) in _INDEXER_ROW_WIDTHS
+
+
+def resolve_indexer_row_geometry(
+    row_bytes: int, dtype: torch.dtype
+) -> "tuple[int, int] | None":
+    """Return the ``(vals_bytes, scale_bytes)`` split of an indexer row.
+
+    ``(128, 4)`` for the fp8 indexer, ``(64, 4)`` for the MXFP4 one, matching
+    the per-block ``[BS x vals][BS x scale]`` decomposition the transfer
+    kernels apply (``val_units = scalars_per_token - scale_units`` with
+    ``scale_units = 4/sizeof(T)`` in ``csrc/cuda/mp_mem_kernels.cu``).
+
+    Args:
+        row_bytes: Trailing content width of the per-layer tensor
+            (``shape[-1]`` / ``desc.hs``).
+        dtype: The per-layer tensor dtype.
+
+    Returns:
+        ``(vals_bytes, scale_bytes)`` when the row is a DSA indexer K record,
+        else ``None``.
+    """
+    if not is_indexer_k_row(row_bytes, dtype):
+        return None
+    return (int(row_bytes) - _INDEXER_SCALE_BYTES, _INDEXER_SCALE_BYTES)
+
+
 def _split_token2d_kv(token2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Accepts either:

@@ -17,7 +17,9 @@ corresponding ``lmcache.integration.<engine>`` package, not here.
 
 # Standard
 from collections.abc import Mapping, Sequence
-from typing import cast
+from dataclasses import dataclass
+from math import lcm
+from typing import Protocol, cast
 
 # Third Party
 import msgspec
@@ -343,3 +345,532 @@ def get_engine_group_indices(
             per_layer_engine_group_idx[layer_idx] = group.engine_group_id
 
     return per_layer_engine_group_idx
+
+
+# ------------------------------------------------------------------ #
+#  Per-group block masks (engine-neutral)                             #
+# ------------------------------------------------------------------ #
+#
+# V4.1 serves a model whose KV cache groups have *different* engine block
+# sizes (production: 8 x 32, 1 x 64, 1 x 8), so a "mask" cannot be one
+# boolean array shared by every group: each group's mask lives on its own
+# engine-block grid (``tokens_per_block`` tokens per grid cell).  This
+# section mirrors the Mooncake external-store coordinator's per-group masks
+# (``store/coordinator.py``: ``load_mask`` / ``store_mask`` / ``lookup_mask``
+# / ``_reachable_masks``), which in turn reuse the engine's own
+# ``SingleTypeKVCacheManager.reachable_block_mask`` for each group's spec.
+#
+# LMCache's lookup doubles as prefetch (the hit length is *the* bound for the
+# keys submitted and read-locked), unlike vLLM's "query -> converge -> trim"
+# flow where a later shrink is harmless.  The one-shot-aligned-length helpers
+# below therefore compute the conservative model-wide hit *before* anything is
+# submitted, and never trim after the fact (see
+# :func:`align_group_servable_length`).
+#
+# Every function here is duck-typed over group descriptors that expose
+# ``tokens_per_block`` / ``sw_size_tokens`` / ``tokens_per_state`` /
+# ``prefix_cacheable`` / ``recurrent_state`` — both
+# :class:`EngineGroupInfo` and the runtime ``KernelGroupInfo`` satisfy them.
+# Groups are keyed by protocol order (``group_idx``), not by their own id.
+
+
+class MaskGroup(Protocol):
+    """Structural type for a per-group mask input (mypy-only structural match).
+
+    Satisfied structurally by both :class:`EngineGroupInfo` (the protocol-
+    visible group view) and the runtime ``KernelGroupInfo`` (dataclass
+    instance attributes; its ``engine_group_idx`` is not part of the mask
+    math, which keys groups by protocol order instead), so the mask
+    computation is engine-neutral and shared by the connector and the server.
+    Not intended for ``isinstance`` checks.
+    """
+
+    tokens_per_block: int
+    sw_size_tokens: int
+    tokens_per_state: int
+    prefix_cacheable: bool
+    recurrent_state: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBlockMask:
+    """One LMCache group's per-block reachability over a token range.
+
+    Covers engine blocks ``[start_block, end_block)`` of this group, i.e.
+    tokens ``[start_block * tokens_per_block, end_block * tokens_per_block)``.
+    ``blocks`` is a bool per block (``True`` = reachable / to store / to
+    load), or ``None`` as the *all-True sentinel* — mirroring Mooncake's
+    ``reachable_block_mask`` returning ``None`` for full attention, so dense
+    groups never materialize a long all-True array.
+    """
+
+    group_idx: int
+    """LMCache group index in protocol order (same index space as
+    ``slice_block_ids_per_group``)."""
+    tokens_per_block: int
+    """Logical tokens covered by one engine block of this group (its own
+    block grid)."""
+    start_block: int
+    """First covered engine block index, inclusive."""
+    end_block: int
+    """Last covered engine block index, exclusive."""
+    blocks: tuple[bool, ...] | None
+    """Per-block flag over ``[start_block, end_block)``; ``None`` = all True
+    (full-attention sentinel)."""
+
+    @property
+    def block_count(self) -> int:
+        """Number of covered blocks (``end_block - start_block``)."""
+        return self.end_block - self.start_block
+
+    def is_reachable(self, block_index: int) -> bool:
+        """Whether one engine block of this group is reachable.
+
+        Args:
+            block_index: An engine block index within
+                ``[start_block, end_block)``.
+
+        Returns:
+            ``True`` if the block is reachable; ``True`` for every block when
+            ``blocks`` is the ``None`` (all-True) sentinel.
+        """
+        if self.blocks is None:
+            return True
+        return self.blocks[block_index - self.start_block]
+
+
+def lcm_block_tokens(groups: Sequence[MaskGroup]) -> int:
+    """Cross-group block-size common multiple (Mooncake's ``lcm_block_size``).
+
+    vLLM's coordinator asserts every ``prefix_cacheable`` group's block size
+    divides the scheduler block size and uses that as the single mask
+    alignment (``store/coordinator.py:100-104,112``).  LMCache computes the
+    least common multiple directly over the groups that participate in prefix
+    caching.
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+
+    Returns:
+        ``lcm(tokens_per_block)`` over ``prefix_cacheable`` groups with a
+        positive reported ``tokens_per_block``.
+
+    Raises:
+        ValueError: If no participating group reports a positive
+            ``tokens_per_block`` (a mask requires a concrete block grid).
+    """
+    block_sizes = [
+        group.tokens_per_block
+        for group in groups
+        if group.prefix_cacheable and group.tokens_per_block > 0
+    ]
+    if not block_sizes:
+        raise ValueError(
+            "cannot compute the cross-group block lcm: no prefix_cacheable "
+            "group reports a positive tokens_per_block"
+        )
+    result = 1
+    for block_size in block_sizes:
+        result = lcm(result, block_size)
+    return result
+
+
+def align_lookup_length(groups: Sequence[MaskGroup], length: int) -> int:
+    """Floor a candidate length to the cross-group mask alignment.
+
+    Mirrors Mooncake's ``align_lookup_length``
+    (``store/coordinator.py:121-127``): only lengths aligned to the cross-group
+    block common multiple are valid hit/store boundaries.
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+        length: Candidate length in tokens.
+
+    Returns:
+        ``length // alignment * alignment`` where ``alignment`` is
+        :func:`lcm_block_tokens` of ``groups``.
+    """
+    alignment = lcm_block_tokens(groups)
+    return length // alignment * alignment
+
+
+def _window_tail_mask(
+    block_tokens: int,
+    window_tokens: int,
+    start_block: int,
+    end_block: int,
+    segment_tokens: int,
+    *,
+    use_eagle: bool = False,
+) -> list[bool] | None:
+    """Sliding-window per-block reachability.
+
+    Faithful translation of vLLM's
+    ``SlidingWindowManager.reachable_block_mask`` with ``retention_interval
+    = None`` (``single_type_kv_cache_manager.py:1067-1091``): a block is
+    reachable iff it can be the tail of a hit at some *segment-aligned*
+    boundary.  Concretely, only the last ``need`` blocks before each segment
+    boundary can serve an aligned hit, so the interior of a segment is masked
+    out.
+
+    Args:
+        block_tokens: This group's ``tokens_per_block`` (its block grid).
+        window_tokens: The group's sliding window in tokens (0 for a
+            one-block mamba-style window).
+        start_block: First covered block index, inclusive.
+        end_block: Last covered block index, exclusive.
+        segment_tokens: Commit-boundary spacing in tokens (LMCache chunk size
+            or the cross-group lcm).
+        use_eagle: Whether to reserve one extra block for the EAGLE peek
+            (Mooncake's ``shift`` / ``need + 1``).
+
+    Returns:
+        A per-block bool list of length ``end_block - start_block``, or
+        ``None`` when every block is reachable (window covers the whole
+        segment, or the segment spacing is not a multiple of ``block_tokens``
+        so the mask cannot be exact and we fall back to dense — never drop).
+
+    Raises:
+        ValueError: If ``block_tokens`` or ``segment_tokens`` is not positive,
+            or the block range is inverted.
+    """
+    if block_tokens <= 0:
+        raise ValueError(f"block_tokens must be positive, got {block_tokens}")
+    if segment_tokens <= 0:
+        raise ValueError(f"segment_tokens must be positive, got {segment_tokens}")
+    if end_block < start_block:
+        raise ValueError(f"block range [{start_block}, {end_block}) is inverted")
+    if segment_tokens % block_tokens != 0:
+        # Sub-block segment: the mask is block-granular and cannot represent
+        # the alignment exactly. Dense fallback never drops a reachable block.
+        return None
+    per_segment = segment_tokens // block_tokens
+    # vLLM's ``_contiguous_blocks_for_hit`` (single_type_kv_cache_manager.py:
+    # 956-966) is ``cdiv(window_size - 1, block_size)`` -- NOT ``ceil(w / b)``
+    # -- plus one when EAGLE peeks a block past the matched run.  The offset
+    # matters when ``window % block == 1`` (e.g. block 32 / window 33: vLLM
+    # only needs 1 contiguous block, a naive ceil needs 2); mirroring it keeps
+    # LMCache's retained block set identical to the local prefix cache's.
+    need = -((window_tokens - 1) // -block_tokens)
+    if use_eagle:
+        # Reserve one extra contiguous block for the EAGLE peek.
+        need += 1
+    if need >= per_segment:
+        # The window (plus peek) spans the whole segment: every block can be
+        # the tail of some aligned hit.
+        return None
+    shift = 1 if use_eagle else 0
+    return [
+        # ``i >= shift`` mirrors vLLM: with an EAGLE peek the block at
+        # i == 0 is deliberately excluded (the peek shifts the matched
+        # run's right edge one block past the boundary).
+        i >= shift and (i - shift) % per_segment >= per_segment - need
+        for i in range(start_block, end_block)
+    ]
+
+
+def _group_block_range(
+    tokens_per_block: int, token_len: int, start_token: int
+) -> tuple[int, int]:
+    """Block range ``[start_block, end_block)`` of one group for a token span.
+
+    Args:
+        tokens_per_block: The group's block grid (must be positive).
+        token_len: Exclusive end of the token range.
+        start_token: Inclusive start of the token range.
+
+    Returns:
+        ``(start_block, end_block)`` with ``start_block =
+        min(end_block, max(0, ceil(start_token / tpb)))`` and ``end_block =
+        token_len // tpb`` — mirroring Mooncake's
+        ``_reachable_masks`` (``store/coordinator.py:290-293``).
+
+    Raises:
+        ValueError: If ``tokens_per_block`` is not positive or ``token_len``
+            is negative.
+    """
+    if tokens_per_block <= 0:
+        raise ValueError(f"tokens_per_block must be positive, got {tokens_per_block}")
+    if token_len < 0:
+        raise ValueError(f"token_len must be >= 0, got {token_len}")
+    end_block = token_len // tokens_per_block
+    start_block = min(
+        end_block, max(0, (start_token + tokens_per_block - 1) // tokens_per_block)
+    )
+    return start_block, end_block
+
+
+def _mask_for_group(
+    group: MaskGroup,
+    group_idx: int,
+    token_len: int,
+    *,
+    start_token: int,
+    segment_tokens: int,
+    exclude_non_cacheable: bool,
+    exclude_recurrent: bool,
+    use_eagle: bool,
+) -> GroupBlockMask:
+    """Build one group's :class:`GroupBlockMask` over the token range.
+
+    Applies the exclusion rules first (Mooncake's ``_verify_and_split`` skip
+    for non-cacheable groups and the ``store_mask`` mamba exclude), then the
+    sliding-window tail mask, then the full-attention all-True sentinel.
+
+    Args:
+        group: One group descriptor (``EngineGroupInfo`` or ``KernelGroupInfo``).
+        group_idx: LMCache group index (protocol order).
+        token_len: Exclusive end of the token range.
+        start_token: Inclusive start of the token range.
+        segment_tokens: Commit-boundary spacing for the window tail mask.
+        exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups
+            (always all-False).
+        exclude_recurrent: Drop ``recurrent_state`` groups (store-side mamba
+            exclude; all-False).
+        use_eagle: Reserve the EAGLE peek block in the window tail mask.
+
+    Returns:
+        The group's block mask.  Excluded groups yield an explicit all-False
+        mask so callers can round-trip the group count.
+    """
+    tpb = group.tokens_per_block
+    start_block, end_block = _group_block_range(tpb, token_len, start_token)
+    block_count = end_block - start_block
+
+    if exclude_non_cacheable and not group.prefix_cacheable:
+        return GroupBlockMask(
+            group_idx, tpb, start_block, end_block, (False,) * block_count
+        )
+    if exclude_recurrent and group.recurrent_state:
+        return GroupBlockMask(
+            group_idx, tpb, start_block, end_block, (False,) * block_count
+        )
+    window_tokens = group.sw_size_tokens
+    if window_tokens >= 0:
+        blocks = _window_tail_mask(
+            tpb,
+            window_tokens,
+            start_block,
+            end_block,
+            segment_tokens,
+            use_eagle=use_eagle,
+        )
+        return GroupBlockMask(
+            group_idx,
+            tpb,
+            start_block,
+            end_block,
+            None if blocks is None else tuple(blocks),
+        )
+    # Full attention: all-True sentinel.
+    return GroupBlockMask(group_idx, tpb, start_block, end_block, None)
+
+
+def compute_group_store_masks(
+    groups: Sequence[MaskGroup],
+    token_len: int,
+    start_token: int = 0,
+    *,
+    segment_tokens: int,
+    exclude_non_cacheable: bool = True,
+    exclude_recurrent: bool = False,
+    use_eagle: bool = False,
+) -> list[GroupBlockMask]:
+    """Per-group store masks for the suffix ``[start_token, token_len)``.
+
+    Mirrors Mooncake's ``store_mask`` (``store/coordinator.py:221-252``):
+    which blocks *after* ``start_token`` each group should persist so a future
+    aligned cache hit can consume them.  The all-True sentinel means "store
+    every block of the range" (full attention).
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+        token_len: Exclusive end of the store range in tokens.
+        start_token: Inclusive start of the store range in tokens (suffix
+            store).
+        segment_tokens: Commit-boundary spacing (LMCache chunk size for the
+            transfer downsample grid, or the cross-group lcm).
+        exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups
+            (per-request scratch is never shareable; Mooncake skips them in
+            ``_verify_and_split_kv_cache_groups``).
+        exclude_recurrent: Drop ``recurrent_state`` groups (Mooncake's
+            ``exclude_mamba=True``; all-False).  LMCache transfers recurrent
+            blocks from the engine's live block table each step, so the
+            connector artifact Mooncake guards against does not apply — keep
+            this False unless a caller wants the store-side exclusion.
+        use_eagle: Reserve the EAGLE peek block in the window tail mask.
+
+    Returns:
+        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+
+    Raises:
+        ValueError: If ``token_len`` is not aligned to the cross-group lcm of
+            the participating groups (see :func:`lcm_block_tokens`), or any
+            group lacks a positive ``tokens_per_block``.
+    """
+    if token_len < 0:
+        raise ValueError(f"token_len must be >= 0, got {token_len}")
+    # A store range that crosses a group-boundary misaligns the mask grid;
+    # fail closed instead of silently dropping blocks.
+    alignment = lcm_block_tokens(groups)
+    if token_len % alignment != 0:
+        raise ValueError(
+            f"token_len {token_len} must be a multiple of the cross-group "
+            f"block lcm {alignment} for a per-group store mask"
+        )
+    masks: list[GroupBlockMask] = []
+    for idx, group in enumerate(groups):
+        masks.append(
+            _mask_for_group(
+                group,
+                idx,
+                token_len,
+                start_token=start_token,
+                segment_tokens=segment_tokens,
+                exclude_non_cacheable=exclude_non_cacheable,
+                exclude_recurrent=exclude_recurrent,
+                use_eagle=use_eagle,
+            )
+        )
+    return masks
+
+
+def compute_group_lookup_masks(
+    groups: Sequence[MaskGroup],
+    token_len: int,
+    *,
+    segment_tokens: int | None = None,
+    exclude_non_cacheable: bool = True,
+) -> list[GroupBlockMask]:
+    """Per-group lookup masks (valid aligned hit boundaries).
+
+    Mirrors Mooncake's ``lookup_mask`` (``store/coordinator.py:254-269``):
+    which per-group blocks can be hit/store boundaries under each group's
+    rule.  ``None`` (all-True) means every block of the range is a candidate.
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+        token_len: Length in tokens to cover (must be aligned to the
+            cross-group lcm).
+        segment_tokens: Commit-boundary spacing; defaults to the cross-group
+            lcm (Mooncake passes ``lcm_block_size`` as
+            ``alignment_tokens`` to ``reachable_block_mask``).
+        exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
+
+    Returns:
+        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+
+    Raises:
+        ValueError: If ``token_len`` is not aligned to the cross-group lcm.
+    """
+    alignment = lcm_block_tokens(groups)
+    if token_len % alignment != 0:
+        raise ValueError(
+            f"token_len {token_len} must be a multiple of the cross-group "
+            f"block lcm {alignment} for a per-group lookup mask"
+        )
+    used_segment = segment_tokens if segment_tokens is not None else alignment
+    masks: list[GroupBlockMask] = []
+    for idx, group in enumerate(groups):
+        masks.append(
+            _mask_for_group(
+                group,
+                idx,
+                token_len,
+                start_token=0,
+                segment_tokens=used_segment,
+                exclude_non_cacheable=exclude_non_cacheable,
+                exclude_recurrent=False,
+                use_eagle=False,
+            )
+        )
+    return masks
+
+
+def compute_group_load_masks(
+    groups: Sequence[MaskGroup],
+    hit_length_tokens: int,
+    *,
+    segment_tokens: int,
+    exclude_non_cacheable: bool = True,
+) -> list[GroupBlockMask]:
+    """Per-group load masks for a model-wide hit of ``hit_length_tokens``.
+
+    Mirrors Mooncake's ``load_mask`` (``store/coordinator.py:198-219``): the
+    blocks each group must fill locally to serve the hit.  The presence
+    decision (which chunks actually hit) is made separately by LMCache's
+    folded lookup; this function only expands the *reachable block set* of the
+    retained prefix ``[0, hit_length_tokens)`` for each group.
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+        hit_length_tokens: Model-wide hit length in tokens (already aligned).
+        segment_tokens: Commit-boundary spacing for the window tail mask.
+        exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
+
+    Returns:
+        One :class:`GroupBlockMask` per LMCache group, in protocol order.
+
+    Raises:
+        ValueError: If ``hit_length_tokens`` is not aligned to the cross-group
+            lcm.
+    """
+    alignment = lcm_block_tokens(groups)
+    if hit_length_tokens % alignment != 0:
+        raise ValueError(
+            f"hit_length_tokens {hit_length_tokens} must be a multiple of the "
+            f"cross-group block lcm {alignment}"
+        )
+    masks: list[GroupBlockMask] = []
+    for idx, group in enumerate(groups):
+        masks.append(
+            _mask_for_group(
+                group,
+                idx,
+                hit_length_tokens,
+                start_token=0,
+                segment_tokens=segment_tokens,
+                exclude_non_cacheable=exclude_non_cacheable,
+                exclude_recurrent=False,
+                use_eagle=False,
+            )
+        )
+    return masks
+
+
+def align_group_servable_length(groups: Sequence[MaskGroup], candidate: int) -> int:
+    """One-shot conservative model-wide hit length (never trimmed after).
+
+    This is the heart of the "lookup doubles as prefetch" difference: vLLM
+    converges the hit length group-by-group and *then* trims, which LMCache
+    cannot do because a shrink after prefetch wastes bandwidth and misaligns
+    the read-lock set.  Instead everything is floored here, before any key is
+    submitted:
+
+    1. each ``prefix_cacheable`` group with ``tokens_per_state > 1`` can only
+       serve a prefix whose length is a multiple of its ``tokens_per_state``
+       (a compressed state exists at ``(pos + 1) % tokens_per_state == 0``);
+    2. the model-wide length is the minimum over those per-group reusable
+       lengths, then floored again to the cross-group block lcm (Mooncake's
+       ``align_lookup_length``).
+
+    Args:
+        groups: The LMCache KV groups, in protocol order.
+        candidate: The raw candidate hit length in tokens (e.g. the length
+            matched by the folded presence bitmaps).
+
+    Returns:
+        The conservative aligned hit length, ``<= candidate``.
+
+    Raises:
+        ValueError: If no group participates in prefix caching.
+    """
+    lcm_tokens = lcm_block_tokens(groups)
+    servable = candidate
+    for group in groups:
+        if not group.prefix_cacheable:
+            continue
+        tokens_per_state = group.tokens_per_state
+        if tokens_per_state > 1:
+            servable = min(servable, candidate // tokens_per_state * tokens_per_state)
+    return servable // lcm_tokens * lcm_tokens

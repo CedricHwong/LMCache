@@ -16,6 +16,16 @@ from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.utils import lmcache_deprecate
 from lmcache.v1.distributed.api import AttnWindowDesc, GroupKind
+from lmcache.v1.multiprocess.group_view import (
+    GroupBlockMask,
+    MaskGroup,
+    align_group_servable_length,
+    align_lookup_length,
+    compute_group_load_masks,
+    compute_group_lookup_masks,
+    compute_group_store_masks,
+    lcm_block_tokens,
+)
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
@@ -55,6 +65,24 @@ DTYPE_MAP: dict[str, torch.dtype] = {
 # load-bearing when one ``engine_group_idx`` mixes layouts (a rank-5 K/V group
 # alongside a rank-3 key-only indexer cache): this field is what splits them
 # into separate kernel groups, each transferred with its own layout.
+#
+# Under cross-layer KV sharing (DeepSeek-V4.1: only 4 of 40 layers own a
+# compressed-KV tensor) the load-bearing dimensions are:
+#   * ``head_size`` splits per-layer caches that share one engine group but
+#     store different row widths -- e.g. G8's main compressed KV (584 B/row)
+#     vs its indexer K cache (132 B/row);
+#   * ``block_size`` is the *physical per-tensor state count* for the per-layer
+#     fused layouts vLLM registers (the ``N`` axis of a ``[B, H, N, C]`` view,
+#     ``= block_size // tokens_per_state``), so layers in one engine group
+#     with different ``tokens_per_state`` split apart (cr=2 layers expose 32
+#     states/block, cr=1 layers 64). This is what keeps a mixed-compression
+#     group like G8 from merging cr=2 and cr=1 layers into one kernel group.
+#     The engine's logical tokens-per-block is NOT part of the identity; it
+#     rides in ``EngineGroupInfo.tokens_per_block`` and the per-group
+#     ``compress_ratio`` is re-derived as ``tokens_per_block // slots_per_block``.
+#   * ``kv_size`` mirrors the transfer kernel's K/V plane semantics: 1 for a
+#     single fused plane (MLA latent rows and fused-packed K/V layouts), 2 for
+#     an explicit K/V split.
 class KernelGroupIdentity(NamedTuple):
     kv_size: int
     num_heads: int
@@ -69,8 +97,20 @@ LayerGroupIdentity = KernelGroupIdentity  # Alias for compatibility
 
 
 # Sentinel ``per_layer_engine_group_idx`` value: a KV tensor tagged with it is
-# excluded from every LMCache group (used for cross-layer KV-sharing layers; see
-# ``create_engine_group_infos_from_vllm``).
+# excluded from every LMCache group.
+#
+# It is the *defensive* fallback for "registered but never grouped" tensors:
+# ``get_engine_group_indices`` tags any registered tensor that no engine group's
+# ``layer_indices`` references, and ``group_layers_by_identity`` skips it. It is
+# NOT how DeepSeek-V4.1's cross-layer KV sharing is handled -- there the 36
+# non-kv-source layers never register a KV tensor at all (``get_kv_cache_spec``
+# returns ``None`` for them, so vLLM never allocates one), so this sentinel
+# never fires for V4.1. It exists for engines that *do* register a tensor for a
+# sharing layer while vLLM aliases it to its owner's cache (e.g.
+# ``kv_sharing_target_layer_name`` models): the owner's group then covers the
+# bytes and the sharing layer must not form its own group (a wrong-block-size
+# group would corrupt the per-group block-id counts). See
+# ``create_engine_group_infos_from_vllm``.
 EXCLUDED_ENGINE_GROUP = -1
 
 
@@ -104,6 +144,7 @@ def group_layers_by_identity(
             does not match ``engine_kv_formats``.
     """
     # First Party
+    from lmcache.v1.gpu_connector.kv_format.specs.registry import get_spec_class
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         get_dtype,
@@ -133,8 +174,18 @@ def group_layers_by_identity(
         if engine_group_idx == EXCLUDED_ENGINE_GROUP:
             continue
         layer_format = engine_kv_formats[idx]
-        mla = lmcache_native.is_mla(layer_format)
-        kv_size = 1 if mla else 2
+        # The identity's ``kv_size`` mirrors the transfer kernel's K/V plane
+        # semantics: 1 for a single fused plane (MLA latent rows and vLLM's
+        # fused-packed layouts, where K/V share the trailing content axis), 2
+        # for an explicit K/V split. ``is_mla`` alone misses the fused-packed
+        # formats -- e.g. BLHNC's ``NL_X_NB_NH_BS_CS`` reports ``is_mla ==
+        # False`` even though the kernel transfers its one plane as kv_size
+        # == 1 (mirroring ``shape_desc.kv_size`` in
+        # ``make_page_buffer_shape_desc``) -- so both flags come from the
+        # format spec.
+        spec_cls = get_spec_class(layer_format)
+        mla = spec_cls.is_mla
+        kv_size = 1 if (mla or spec_cls.is_fused_packed) else 2
         nh = 1 if mla else get_num_heads(kv_caches, layer_format, idx)
         hs = get_head_size(kv_caches, layer_format, idx)
         dt = get_dtype(kv_caches, layer_format, idx)
@@ -217,6 +268,20 @@ class KernelGroupInfo:
     """Whether this group's pages hold recurrent state snapshots (Mamba/GDN)
     rather than per-token attention KV. The window reflects restore
     semantics, so ``full_sw_kv`` forcing must not widen it."""
+    tokens_per_state: int = 1
+    """Tokens covered by one stored *state* for this group (engine-declared
+    ``EngineGroupInfo.tokens_per_state``; ``1`` = uncompressed or engine did
+    not report it).  This is the per-group compression granularity that a
+    compressed group's store/load mask and hit length must be multiples of,
+    and is distinct from ``tokens_per_block`` (the logical token span of one
+    engine block id).  The engine-declared value is cross-checked against the
+    geometry-derived ratio ``tokens_per_block // slots_per_block`` at
+    construction (see ``_validate_block_chunk_size_config``)."""
+    prefix_cacheable: bool = True
+    """Whether this group's pages participate in prefix caching (mirrors
+    ``EngineGroupInfo.prefix_cacheable``).  ``False`` marks a per-request
+    scratch pool (e.g. the V4.1 compressor ring): it never stores, looks up,
+    or contributes to a hit length."""
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -235,7 +300,9 @@ class KernelGroupInfo:
             f"tokens_per_block={self.tokens_per_block}, "
             f"slots_per_block={self.slots_per_block}, "
             f"engine_group_idx={self.engine_group_idx}, "
-            f"sw_size_tokens={self.sw_size_tokens})"
+            f"sw_size_tokens={self.sw_size_tokens}, "
+            f"tokens_per_state={self.tokens_per_state}, "
+            f"prefix_cacheable={self.prefix_cacheable})"
         )
 
     @property
@@ -260,6 +327,20 @@ class KernelGroupInfo:
         tokens. Assuming the number of tokens are already aligned.
         """
         return num_tokens * self.slots_per_block // self.tokens_per_block
+
+    @property
+    def state_tokens(self) -> int:
+        """Tokens covered by one reusable stored state of this group.
+
+        The compression granularity (= the engine-declared
+        ``tokens_per_state``, with the uncompressed default ``1``).  A
+        compressed group (``state_tokens > 1``) stores a state only at
+        ``(position + 1) % state_tokens == 0``, so its mask is only valid at
+        store/load lengths that are multiples of it.  This is *not* the same
+        quantity as ``tokens_per_block`` (the token span of one engine block
+        id); feeding one in place of the other corrupts per-block counts.
+        """
+        return self.tokens_per_state
 
 
 KVLayerGroupInfo = KernelGroupInfo  # Alias for compatibility
@@ -438,6 +519,15 @@ class KVLayerGroupsManager:
                 else bs
             )
             sw_size_tokens = info.sw_size_tokens if info is not None else -1
+            # tokens_per_state is only meaningful when the engine also reported
+            # a real block span; otherwise the cross-check against the tensor
+            # geometry is skipped and the group falls back to uncompressed.
+            declared_tokens_per_state = (
+                info.tokens_per_state
+                if info is not None and info.tokens_per_block > 0
+                else None
+            )
+            prefix_cacheable = info.prefix_cacheable if info is not None else True
 
             self._validate_block_chunk_size_config(
                 group_idx,
@@ -445,6 +535,7 @@ class KVLayerGroupsManager:
                 tokens_per_block=tokens_per_block,
                 lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
                 sw_size_tokens=sw_size_tokens,
+                declared_tokens_per_state=declared_tokens_per_state,
             )
 
             self._kernel_groups.append(
@@ -462,6 +553,12 @@ class KVLayerGroupsManager:
                     recurrent_state=(
                         info.recurrent_state if info is not None else False
                     ),
+                    tokens_per_state=(
+                        declared_tokens_per_state
+                        if declared_tokens_per_state is not None
+                        else 1
+                    ),
+                    prefix_cacheable=prefix_cacheable,
                 )
             )
 
@@ -660,6 +757,162 @@ class KVLayerGroupsManager:
         )
         return num_physical_slots // group.shape_desc.bs
 
+    # ------------------------------------------------------------------
+    # Per-group store/load masks (V4.1)
+    #
+    # V4.1 serves groups with *different* engine block sizes (e.g. 8 x 32,
+    # 1 x 64, 1 x 8), so a mask over a single block grid is not meaningful.
+    # These methods expose the engine-neutral per-group mask primitives
+    # (``lmcache.v1.multiprocess.group_view``) over this manager's kernel
+    # groups; every kernel group structurally satisfies :class:`MaskGroup`.
+    # ------------------------------------------------------------------
+
+    def mask_group_inputs(self) -> Sequence[MaskGroup]:
+        """The kernel groups as engine-neutral mask inputs.
+
+        Returns:
+            The manager's ``kernel_groups`` (each structurally satisfies
+            :class:`MaskGroup` via ``tokens_per_block`` / ``sw_size_tokens`` /
+            ``tokens_per_state`` / ``prefix_cacheable`` / ``recurrent_state``),
+            in protocol order — the mask consumers read the same per-group
+            block grid the transfer path uses.
+        """
+        return list(self._kernel_groups)
+
+    def lcm_block_tokens(self) -> int:
+        """Cross-group block-size common multiple of the cacheable groups.
+
+        Mirrors Mooncake's ``lcm_block_size``
+        (``store/coordinator.py:96-104,112``): the single alignment every
+        per-group mask and store/lookup length must be a multiple of.
+
+        Returns:
+            ``lcm(tokens_per_block)`` over ``prefix_cacheable`` kernel groups.
+
+        Raises:
+            ValueError: If no cacheable group reports a positive
+                ``tokens_per_block``.
+        """
+        return lcm_block_tokens(self._kernel_groups)
+
+    def align_lookup_length(self, length: int) -> int:
+        """Floor a length to the cross-group mask alignment.
+
+        Args:
+            length: Candidate length in tokens.
+
+        Returns:
+            ``length // alignment * alignment`` (see :func:`align_lookup_length`
+            in ``group_view``).
+        """
+        return align_lookup_length(self._kernel_groups, length)
+
+    def compute_group_store_masks(
+        self,
+        token_len: int,
+        start_token: int = 0,
+        *,
+        segment_tokens: int | None = None,
+        exclude_non_cacheable: bool = True,
+        exclude_recurrent: bool = False,
+    ) -> list[GroupBlockMask]:
+        """Per-kernel-group store masks for the suffix
+        ``[start_token, token_len)``.
+
+        Args:
+            token_len: Exclusive end of the store range in tokens (must be a
+                multiple of the cross-group lcm).
+            start_token: Inclusive start of the store range.
+            segment_tokens: Commit-boundary spacing; defaults to the LMCache
+                chunk size so the mask reproduces the transfer path's
+                per-chunk window/downsample grid.
+            exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
+            exclude_recurrent: Drop ``recurrent_state`` groups (store-side
+                mamba-style exclude).
+
+        Returns:
+            One :class:`GroupBlockMask` per kernel group (protocol order).
+        """
+        if segment_tokens is None:
+            segment_tokens = self._lmcache_tokens_per_chunk
+        return compute_group_store_masks(
+            self._kernel_groups,
+            token_len,
+            start_token=start_token,
+            segment_tokens=segment_tokens,
+            exclude_non_cacheable=exclude_non_cacheable,
+            exclude_recurrent=exclude_recurrent,
+        )
+
+    def compute_group_lookup_masks(
+        self,
+        token_len: int,
+        *,
+        segment_tokens: int | None = None,
+        exclude_non_cacheable: bool = True,
+    ) -> list[GroupBlockMask]:
+        """Per-kernel-group lookup masks (valid aligned hit boundaries).
+
+        Args:
+            token_len: Length in tokens to cover (already lcm-aligned).
+            segment_tokens: Commit-boundary spacing; defaults to the
+                cross-group lcm.
+            exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
+
+        Returns:
+            One :class:`GroupBlockMask` per kernel group (protocol order).
+        """
+        return compute_group_lookup_masks(
+            self._kernel_groups,
+            token_len,
+            segment_tokens=segment_tokens,
+            exclude_non_cacheable=exclude_non_cacheable,
+        )
+
+    def compute_group_load_masks(
+        self,
+        hit_length_tokens: int,
+        *,
+        segment_tokens: int | None = None,
+        exclude_non_cacheable: bool = True,
+    ) -> list[GroupBlockMask]:
+        """Per-kernel-group load masks for a model-wide hit.
+
+        Args:
+            hit_length_tokens: Model-wide hit length in tokens (lcm-aligned).
+            segment_tokens: Commit-boundary spacing; defaults to the LMCache
+                chunk size.
+            exclude_non_cacheable: Drop ``prefix_cacheable == False`` groups.
+
+        Returns:
+            One :class:`GroupBlockMask` per kernel group (protocol order).
+        """
+        if segment_tokens is None:
+            segment_tokens = self._lmcache_tokens_per_chunk
+        return compute_group_load_masks(
+            self._kernel_groups,
+            hit_length_tokens,
+            segment_tokens=segment_tokens,
+            exclude_non_cacheable=exclude_non_cacheable,
+        )
+
+    def align_group_servable_length(self, candidate: int) -> int:
+        """One-shot conservative model-wide hit length (never trimmed after).
+
+        Floors ``candidate`` to every cacheable group's ``tokens_per_state``
+        multiple and then to the cross-group block lcm, *before* any
+        prefetch is submitted — LMCache's lookup doubles as prefetch, so a
+        post-hoc trim (vLLM's converge loop) would waste bandwidth and
+        misalign the read-lock set.
+
+        Args:
+            candidate: Raw candidate hit length in tokens.
+
+        Returns:
+            The conservative aligned hit length, ``<= candidate``.
+        """
+        return align_group_servable_length(self._kernel_groups, candidate)
+
     ### Helper methods
     def _detect_object_groups(
         self, engine_group_infos: "Sequence[EngineGroupInfo]"
@@ -728,9 +981,21 @@ class KVLayerGroupsManager:
         tokens_per_block: int,
         lmcache_tokens_per_chunk: int,
         sw_size_tokens: int = -1,
+        declared_tokens_per_state: int | None = None,
     ) -> None:
         """Validate the chunk size configuration against the slot and
         tokens block detected from the serving engine.
+
+        Args:
+            group_idx: 0-based group index (for error messages).
+            slots_per_block: Physical slot count per block (tensor-detected).
+            tokens_per_block: Logical tokens per engine block id.
+            lmcache_tokens_per_chunk: LMCache chunk size in tokens.
+            sw_size_tokens: Sliding window size in tokens (``-1`` = full
+                attention).
+            declared_tokens_per_state: Engine-declared tokens per stored state
+                (``None`` = engine did not report a block span, so the derived
+                compression ratio is trusted without a cross-check).
 
         Raises:
             ValueError: If one of the following conditions is met:
@@ -740,6 +1005,10 @@ class KVLayerGroupsManager:
                   ``tokens_per_block``
                 - a sub-chunk sliding window is not a whole multiple of
                   ``tokens_per_block``
+                - the geometry-derived compression ratio
+                  ``tokens_per_block // slots_per_block`` differs from the
+                  engine-declared ``declared_tokens_per_state`` (fail-fast
+                  instead of silently deriving a wrong mask / hit length)
         """
         if tokens_per_block % slots_per_block != 0:
             raise ValueError(
@@ -760,6 +1029,24 @@ class KVLayerGroupsManager:
                 f"group {group_idx}: sub-chunk sliding window size "
                 f"{sw_size_tokens} must be a multiple of tokens_per_block "
                 f"{tokens_per_block}"
+            )
+        # Fail-fast on geometry/declaration conflicts *only when the engine
+        # meaningfully declared compression* (tokens_per_state > 1).  A
+        # defaulted tokens_per_state == 1 is indistinguishable from an engine
+        # that never reported the field (old vLLM), so its consistency is
+        # trusted from the tensor geometry instead.
+        if (
+            declared_tokens_per_state is not None
+            and declared_tokens_per_state > 1
+            and tokens_per_block // slots_per_block != declared_tokens_per_state
+        ):
+            raise ValueError(
+                f"group {group_idx}: engine declares tokens_per_state="
+                f"{declared_tokens_per_state}, but the detected slot geometry "
+                f"(tokens_per_block {tokens_per_block} / slots_per_block "
+                f"{slots_per_block}) implies a compression ratio of "
+                f"{tokens_per_block // slots_per_block}; refusing to build a "
+                "mask / hit length from contradictory geometry"
             )
         if slots_per_block != tokens_per_block:
             logger.info(

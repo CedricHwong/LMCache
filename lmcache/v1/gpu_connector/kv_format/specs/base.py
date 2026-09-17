@@ -154,6 +154,18 @@ class KVFormatSpec(ABC):
     # than a single stacked per-layer tensor.
     is_kv_second_tuple: ClassVar[bool] = False
 
+    # NOTE: there is deliberately NO per-format "cacheable" fact here. Whether
+    # a cache may be reused across requests is declared by the serving engine
+    # *per spec instance* (vLLM's ``KVCacheSpec.prefix_cacheable`` /
+    # ``uses_slot_mapping``), never by byte shape: the same format
+    # (``NL_X_NB_NH_BS_CS``) hosts both reusable MLA pools and DeepSeek-V4.1's
+    # per-request compressor ring (``CircularBufferSpec``), whose tensors are
+    # shape-indistinguishable from a real pool. That ring group must be
+    # excluded by the vLLM group builder from the engine declaration
+    # (``is_circular_buffer_ring_spec`` in ``kv_format.detectors.vllm``)
+    # BEFORE any spec is constructed -- a format-level fact could not tell it
+    # apart and would silently bless the wrong bytes.
+
     def __init__(self, kv_caches: DiscoverableKVCache) -> None:
         # Borrowed, not owned: see the class docstring's "Lifetime" note. The
         # spec must stay transient so it never outlives the engine's KV tensors.

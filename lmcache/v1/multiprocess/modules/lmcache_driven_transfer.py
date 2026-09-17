@@ -2,7 +2,7 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 import threading
 import time
@@ -120,6 +120,58 @@ def all_null_chunk_masks(
             chunk_null.append(is_null)
         masks.append(chunk_null)
     return masks
+
+
+def clamp_store_key_to_accepted_prefix(
+    key: IPCCacheServerKey, chunk_size: int
+) -> IPCCacheServerKey | None:
+    """Bound a store op's token range to the accepted (verified) prefix.
+
+    With speculative decoding the vLLM-side connector builds store ops from the
+    raw scheduled token count, which includes draft tokens that the target
+    rejects. Draft-token KV slots are written into the paged cache but are
+    transient: they are overwritten by the accepted tokens in a later step, so
+    their bytes must never be committed. The session's rolling chunk hashes are
+    derived from the accepted token sequence, so an over-claiming ``key.end``
+    would raise in ``Session.get_hashes`` and fail the whole store. Instead,
+    clamp ``end`` to the last full chunk inside the accepted prefix and let the
+    trailing (not-yet-verified) chunk be stored by a later step.
+
+    Args:
+        key: The IPC cache key of the store op.
+        chunk_size: The LMCache chunk size (tokens per memory object).
+
+    Returns:
+        A copy of ``key`` with ``end`` reduced to a chunk boundary inside
+        ``len(key.token_ids)``, or ``None`` when no full chunk remains inside
+        the accepted prefix (nothing to store).
+    """
+    accepted = len(key.token_ids)
+    if key.end <= accepted:
+        return key
+    end = accepted - accepted % chunk_size
+    if end <= key.start:
+        logger.warning(
+            "STORE over-claims its token range for request_id=%s: key.end=%d "
+            "exceeds the accepted prefix (%d tokens); dropping the trailing "
+            "chunk(s). Probable cause: speculative drafts were rejected while "
+            "the store range was computed from the raw scheduled token count.",
+            key.request_id,
+            key.end,
+            accepted,
+        )
+        return None
+    logger.warning(
+        "STORE over-claims its token range for request_id=%s: key.end=%d "
+        "clamped to %d (accepted prefix=%d tokens). Probable cause: "
+        "speculative drafts were rejected while the store range was computed "
+        "from the raw scheduled token count.",
+        key.request_id,
+        key.end,
+        end,
+        accepted,
+    )
+    return replace(key, end=end)
 
 
 @dataclass
@@ -579,6 +631,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             raise RuntimeError("Registered cache context has no event backend")
 
         num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
+        key = clamp_store_key_to_accepted_prefix(key, self._ctx.chunk_size)
+        if key is None:
+            # Nothing to store: the whole over-claiming range lies beyond the
+            # accepted prefix (rejected speculative drafts). Record a completion
+            # event so the client's future resolves, and report a store failure
+            # (False) -- the unaffected chunks are simply not cached and will
+            # be recomputed, exactly like any other failed store.
+            event = event_backend.create_event(cache_context.device)
+            event_backend.record_event(event, cache_context.stream)
+            return event_backend.export_event(event, cache_context.device), False
         obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
             key, list(range(num_object_groups))
         )

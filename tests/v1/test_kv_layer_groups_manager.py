@@ -19,7 +19,10 @@ from lmcache.v1.kv_layer_groups import (
     group_layers_by_identity,
     parse_kvcache_shape_spec,
 )
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    get_engine_group_indices,
+)
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -782,6 +785,97 @@ class TestKernelAndObjectGroups:
         assert group.slots_per_block == 8
         assert group.tokens_per_block // group.slots_per_block == 2
         assert manager.calculate_num_blocks(0, 256) == 16
+
+
+class TestCrossLayerKV:
+    """Cross-layer KV sharing (DeepSeek-V4.1-style): 40 layers but only 4 own
+    a compressed-KV tensor, and one vLLM engine group mixes main-KV and
+    indexer-K layers with different ``tokens_per_state``. The kernel-group
+    identity must split them, never merge them."""
+
+    _BLHNC = lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+
+    def _identity_for_layer(self, tensor, engine_format, engine_group_idx=5):
+        """Return the lone KernelGroupIdentity of ``tensor`` under ``format``."""
+        groups = group_layers_by_identity(
+            [tensor],
+            [engine_format],
+            per_layer_engine_group_idx=[engine_group_idx],
+        )
+        assert len(groups) == 1
+        return groups[0][0]
+
+    def test_identity_kv_size_matches_kernel_plane(self):
+        # Fused-packed layouts (BLHNC's NL_X_NB_NH_BS_CS, K/V packed in the
+        # trailing content axis) report is_mla() == False, but the transfer
+        # kernel reads them as a single fused plane (kv_size == 1, like MLA).
+        # The identity must say 1, not 2, so a fused cache never collides with
+        # a literal 2-plane split in the same engine group.
+        fused = torch.zeros(32, 1, 32, 584, dtype=torch.uint8)  # [B, H, N, C]
+        ident = self._identity_for_layer(fused, self._BLHNC)
+        assert ident.kv_size == 1
+        assert ident.engine_kv_format == self._BLHNC
+        # A plain K/V NHD layout still reports 2.
+        plain = torch.randn(2, 32, 32, 8, 64, dtype=torch.float16)
+        plain_ident = self._identity_for_layer(
+            plain,
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        )
+        assert plain_ident.kv_size == 2
+
+    def test_mixed_tps_group_splits_not_merges(self):
+        """One vLLM engine group (G8-style) holds main-KV and indexer-K layers
+        whose tokens_per_state differ (cr=2 vs cr=1). Per-layer tensors expose
+        their per-block state count as the N axis, so the identity splits into
+        four kernel groups: (main, cr=2) / (main, cr=1) / (indexer, cr=2) /
+        (indexer, cr=1). Merging any pair would transfer the other geometry
+        (32 vs 64 slots/block, 584 vs 132 B/row) with the first layer's
+        shape_desc and corrupt the pages."""
+        # (row width, per-block state count): kv-source L2/8/14 cr=2, L20 cr=1;
+        # the indexer K cache has its own narrower row width.
+        tensors = [
+            torch.zeros(32, 1, 32, 584, dtype=torch.uint8),  # main L2  cr=2
+            torch.zeros(32, 1, 32, 584, dtype=torch.uint8),  # main L8  cr=2
+            torch.zeros(32, 1, 32, 584, dtype=torch.uint8),  # main L14 cr=2
+            torch.zeros(32, 1, 64, 584, dtype=torch.uint8),  # main L20 cr=1
+            torch.zeros(32, 1, 32, 132, dtype=torch.uint8),  # idx L2  cr=2
+            torch.zeros(32, 1, 32, 132, dtype=torch.uint8),  # idx L8  cr=2
+            torch.zeros(32, 1, 32, 132, dtype=torch.uint8),  # idx L14 cr=2
+            torch.zeros(32, 1, 64, 132, dtype=torch.uint8),  # idx L20 cr=1
+        ]
+        groups = group_layers_by_identity(
+            tensors,
+            [self._BLHNC] * len(tensors),
+            per_layer_engine_group_idx=[8] * len(tensors),
+        )
+        # Four distinct kernel groups, each homogeneous in (hs, block_size).
+        assert len(groups) == 4
+        members = {
+            tuple(sorted(idxs)): (id.head_size, id.block_size, id.kv_size)
+            for id, idxs in groups
+        }
+        assert members[(0, 1, 2)] == (584, 32, 1)
+        assert members[(3,)] == (584, 64, 1)
+        assert members[(4, 5, 6)] == (132, 32, 1)
+        assert members[(7,)] == (132, 64, 1)
+        # Every registered tensor lands in exactly one group (none excluded).
+        assert sorted(i for _, idxs in groups for i in idxs) == list(range(8))
+
+    def test_all_assigned_layers_never_excluded(self):
+        """V4.1's registered tensors are all referenced by a vLLM engine group,
+        so EXCLUDED_ENGINE_GROUP never fires and no layer is dropped."""
+        engine_group_infos = [
+            EngineGroupInfo(0, (0,)),
+            EngineGroupInfo(1, (1,)),
+            EngineGroupInfo(8, (2, 3)),
+            EngineGroupInfo(8, (4,)),
+            EngineGroupInfo(9, (5,)),
+        ]
+        per_layer = get_engine_group_indices(engine_group_infos, 6)
+        assert EXCLUDED_ENGINE_GROUP not in per_layer
+        # A tensor referenced by no group is the inverse: it IS excluded.
+        excluded = get_engine_group_indices([EngineGroupInfo(0, (0,))], 3)
+        assert excluded == [0, EXCLUDED_ENGINE_GROUP, EXCLUDED_ENGINE_GROUP]
 
 
 if __name__ == "__main__":

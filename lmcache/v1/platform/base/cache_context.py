@@ -13,8 +13,9 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 import array
+import math
 
 # Third Party
 import torch
@@ -291,6 +292,257 @@ class BaseCacheContext(ABC):
         return get_concrete_engine_kv_shape_from_shape_desc(
             group.shape_desc, engine_kv_format
         )
+
+    # ------------------------------------------------------------------
+    # Hybrid cross-group alignment (pure helpers)
+    # ------------------------------------------------------------------
+    #
+    # A hybrid engine (DeepSeek V4.1: 8 SWA groups @32 tokens/block, 1
+    # MLA group @64, 1 ring-buffer group @8) addresses blocks with
+    # *different* token spans per group, so a single "hit length" is only
+    # well defined at token positions that are whole blocks in **every**
+    # group. vLLM / the Mooncake KV store align on the lcm of the group
+    # block sizes; these helpers expose the same alignment to LMCache and
+    # translate an aligned token length into per-group whole-block / whole-
+    # state physical commitments.
+
+    @property
+    def group_tokens_per_blocks(self) -> list[int]:
+        """Logical engine tokens per paged block, per kernel group.
+
+        ``KernelGroupInfo.tokens_per_block`` is the scheduler-token span of
+        one engine block id (32/64/8 in the V4.1 production layout). The
+        group manager already normalizes ``0`` (engine did not report) to
+        the physical slot count, so every entry here is positive.
+
+        Returns:
+            One entry per kernel group, in kernel-group order.
+        """
+        return [
+            group.tokens_per_block
+            for group in self.kv_layer_groups_manager.kernel_groups
+        ]
+
+    @property
+    def group_slots_per_blocks(self) -> list[int]:
+        """Physical slots per paged block, per kernel group.
+
+        ``KernelGroupInfo.slots_per_block`` is the detected per-block slot
+        count (``shape_desc.bs``, the states-per-block axis ``N`` of the
+        BLHNC layout). For a ``tokens_per_state>1`` group it is
+        ``tokens_per_block // tokens_per_state``, so it is *smaller* than
+        the logical block span.
+
+        Exposed as a property to match the existing
+        ``CPUCacheContext.group_slots_per_blocks`` property (same values,
+        same call convention) so the two backends share one interface.
+
+        Returns:
+            One entry per kernel group, in kernel-group order.
+        """
+        return [
+            group.slots_per_block
+            for group in self.kv_layer_groups_manager.kernel_groups
+        ]
+
+    def group_compress_ratios(self) -> list[int]:
+        """Returns the derived tokens-per-physical-slot per kernel group.
+
+        ``compress_ratio = tokens_per_block // slots_per_block`` is the
+        LMCache-recovered "tokens per stored state": one physical slot
+        stores ``compress_ratio`` logical tokens, ``1`` = uncompressed. It
+        equals the engine-declared ``tokens_per_state`` whenever the tensor
+        detection recovered the slot count correctly.
+
+        Raises:
+            ValueError: If a group reports non-positive geometry, or
+                ``tokens_per_block`` is not a whole multiple of
+                ``slots_per_block`` (a single ratio is then undefined --
+                mixed ``tokens_per_state`` layers of one engine group must be
+                split into separate kernel/engine groups).
+        """
+        ratios = []
+        for idx, group in enumerate(self.kv_layer_groups_manager.kernel_groups):
+            tokens_per_block = group.tokens_per_block
+            slots_per_block = group.slots_per_block
+            if tokens_per_block <= 0 or slots_per_block <= 0:
+                raise ValueError(
+                    f"kernel group {idx}: non-positive geometry "
+                    f"tokens_per_block={tokens_per_block}, "
+                    f"slots_per_block={slots_per_block}"
+                )
+            if tokens_per_block % slots_per_block != 0:
+                raise ValueError(
+                    f"kernel group {idx}: tokens_per_block {tokens_per_block} "
+                    f"is not a multiple of slots_per_block {slots_per_block}; "
+                    "a single group-level compression ratio is undefined. "
+                    "Mixed tokens_per_state layers (e.g. L2/L8/L14 cr=2 vs "
+                    "L20 cr=1 in one engine group) must be split into "
+                    "separate groups at detection time."
+                )
+            ratios.append(tokens_per_block // slots_per_block)
+        return ratios
+
+    def group_lcm_block_size(
+        self, include: Sequence[bool] | None = None
+    ) -> int:
+        """Returns the cross-group prefix alignment in logical tokens.
+
+        The lcm of the selected groups' ``tokens_per_block``, mirroring
+        vLLM's ``scheduler_block_size = math.lcm(*group_block_sizes)`` that
+        the Mooncake coordinator uses as ``mask_alignment``. A hit length is
+        only safely shared across groups when every selected group covers a
+        whole number of its own blocks, i.e. the length is a multiple of
+        this value.
+
+        ``include`` may be a per-kernel-group boolean mask (in kernel-group
+        order) selecting only the groups that participate in prefix caching
+        (``prefix_cacheable=True``); ``None`` uses every group. Using a
+        non-prefix-cacheable group in the lcm can only over-align (never
+        under-align), so including all groups is safe as a default.
+
+        Args:
+            include: Optional boolean mask over kernel groups selecting the
+                groups that participate in the alignment.
+
+        Returns:
+            The lcm alignment in tokens (``1`` when no group is selected).
+
+        Raises:
+            ValueError: If *include*'s length differs from the number of
+                kernel groups, or a selected group reports a non-positive
+                ``tokens_per_block``.
+        """
+        tokens_per_blocks = self.group_tokens_per_blocks
+        if include is not None:
+            if len(include) != len(tokens_per_blocks):
+                raise ValueError(
+                    f"include mask has {len(include)} entries but there are "
+                    f"{len(tokens_per_blocks)} kernel groups"
+                )
+            tokens_per_blocks = [
+                tokens_per_block
+                for tokens_per_block, keep in zip(tokens_per_blocks, include)
+                if keep
+            ]
+        if not tokens_per_blocks:
+            return 1
+        for tokens_per_block in tokens_per_blocks:
+            if tokens_per_block <= 0:
+                raise ValueError(
+                    f"non-positive tokens_per_block {tokens_per_block} in a "
+                    "selected group; the cross-group alignment is undefined"
+                )
+        return math.lcm(*tokens_per_blocks)
+
+    def align_hit_length(
+        self, hit_length: int, include: Sequence[bool] | None = None
+    ) -> int:
+        """Floors *hit_length* to the cross-group alignment.
+
+        A candidate hit length that is not a multiple of
+        :meth:`group_lcm_block_size` would cut a block (or a compressed
+        state) mid-way in at least one group; this returns the largest
+        multiple of the alignment not exceeding *hit_length* so every
+        selected group serves whole blocks and whole states. Mirrors the
+        Mooncake store's ``align_lookup_length``.
+
+        Args:
+            hit_length: Candidate hit length in logical tokens.
+            include: Optional per-kernel-group boolean mask forwarded to
+                :meth:`group_lcm_block_size`.
+
+        Returns:
+            ``hit_length // alignment * alignment``; ``0`` when *hit_length*
+            is smaller than one alignment unit.
+
+        Raises:
+            ValueError: If *hit_length* is negative or the alignment cannot
+                be computed (see :meth:`group_lcm_block_size`).
+        """
+        if hit_length < 0:
+            raise ValueError(f"hit_length {hit_length} must be non-negative")
+        alignment = self.group_lcm_block_size(include)
+        return hit_length // alignment * alignment
+
+    def hit_length_per_group(self, hit_length: int) -> list[int]:
+        """Returns how many logical tokens each group can serve for a hit.
+
+        Per group ``g`` this is the largest multiple of ``g``'s
+        ``tokens_per_block`` not exceeding the candidate hit length, i.e.
+        the independent per-group coverage before any joint trim. The
+        minimum across all groups equals :meth:`align_hit_length` because
+        that alignment is the lcm of the group token spans. This is the
+        "who serves whole blocks" breakdown: a 32-token group can serve a
+        96-token candidate (3 blocks) while a 64-token group can only serve
+        64 (1 block), so the joint hit must be trimmed to 64.
+
+        Args:
+            hit_length: Candidate hit length in logical tokens.
+
+        Returns:
+            Per-group servable token counts, in kernel-group order; the
+            minimum of these equals :meth:`align_hit_length` for the same
+            *hit_length*.
+
+        Raises:
+            ValueError: If *hit_length* is negative or group geometry is
+                invalid.
+        """
+        if hit_length < 0:
+            raise ValueError(f"hit_length {hit_length} must be non-negative")
+        per_group = []
+        for tokens_per_block in self.group_tokens_per_blocks:
+            if tokens_per_block <= 0:
+                raise ValueError(
+                    f"non-positive tokens_per_block {tokens_per_block}; "
+                    "cannot compute per-group hit coverage"
+                )
+            per_group.append(hit_length // tokens_per_block * tokens_per_block)
+        return per_group
+
+    def hit_length_physical_states(
+        self, hit_length: int, include: Sequence[bool] | None = None
+    ) -> list[int]:
+        """Returns each group's whole physical state count for a hit.
+
+        A ``tokens_per_state>1`` group stores one physical slot per
+        ``tokens_per_state`` logical tokens, so only group-boundary tokens
+        are valid: serving a length that is not a state boundary would cut a
+        stored state in half. This returns the number of whole states each
+        group commits at the aligned length, exactly
+        ``aligned_tokens * slots_per_block // tokens_per_block`` (an integer
+        whenever the group's ``tokens_per_block`` divides the alignment, and
+        floored per group otherwise).
+
+        Args:
+            hit_length: Candidate hit length in logical tokens.
+            include: Optional per-kernel-group boolean mask forwarded to
+                :meth:`group_lcm_block_size`.
+
+        Returns:
+            Per-group whole-state counts, in kernel-group order.
+
+        Raises:
+            ValueError: If *hit_length* is negative or group geometry is
+                invalid (see :meth:`align_hit_length`).
+        """
+        if hit_length < 0:
+            raise ValueError(f"hit_length {hit_length} must be non-negative")
+        aligned = self.align_hit_length(hit_length, include)
+        states = []
+        for idx, group in enumerate(self.kv_layer_groups_manager.kernel_groups):
+            tokens_per_block = group.tokens_per_block
+            slots_per_block = group.slots_per_block
+            if tokens_per_block <= 0 or slots_per_block <= 0:
+                raise ValueError(
+                    f"kernel group {idx}: non-positive geometry "
+                    f"tokens_per_block={tokens_per_block}, "
+                    f"slots_per_block={slots_per_block}"
+                )
+            group_aligned = aligned // tokens_per_block * tokens_per_block
+            states.append(group_aligned * slots_per_block // tokens_per_block)
+        return states
 
     # ------------------------------------------------------------------
     # Shared report_status

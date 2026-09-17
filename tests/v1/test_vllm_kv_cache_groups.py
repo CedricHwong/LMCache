@@ -10,6 +10,7 @@ import torch
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
 )
+from lmcache.v1.kv_layer_groups import EXCLUDED_ENGINE_GROUP
 from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
     get_engine_group_indices,
@@ -61,6 +62,21 @@ class MambaSpec:
 
     block_size: int
     mamba_cache_mode: str = "align"
+
+
+@dataclass
+class CircularBufferSpec(AttentionSpec):
+    """DeepSeek-V4.1 compressor state ring (detected by class name).
+
+    One block per request holds the raw ``[kv, score]`` rows of the token
+    group still being compressed; vLLM declares it non-cacheable. The real
+    vLLM class exposes ``prefix_cacheable`` / ``uses_slot_mapping`` as
+    properties returning ``False``; the double carries them as fields so tests
+    can also exercise the fail-closed contradiction path.
+    """
+
+    prefix_cacheable: bool = False
+    uses_slot_mapping: bool = False
 
 
 @dataclass
@@ -467,3 +483,103 @@ def test_conversion_tokens_per_block_unscaled_without_dcp():
 
     assert [g.tokens_per_block for g in default] == [16, 16]
     assert [g.tokens_per_block for g in explicit] == [16, 16]
+
+
+# ============================================================================
+# Compressor circular-buffer ring exclusion (DeepSeek-V4.1)
+# ============================================================================
+
+
+def test_conversion_excludes_compressor_ring_group():
+    """A ``CircularBufferSpec`` ring group (per-request compressor scratch) is
+    excluded from every LMCache group.
+
+    Its layers form no ``EngineGroupInfo`` and are left
+    ``EXCLUDED_ENGINE_GROUP``, so the daemon never builds a kernel group for
+    them and they can never be silently stored as if they were request-
+    reusable prefix KV. The cacheable groups keep their original engine group
+    ids and order.
+    """
+    caches = _same_shape_caches(["main.0", "ring.0"])
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["main.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["ring.0"], CircularBufferSpec(block_size=8)),
+            ]
+        ),
+        caches,
+    )
+
+    # Only the cacheable main group survives; the ring forms no group.
+    assert num_engine_groups(spec) == 1
+    assert [g.engine_group_id for g in spec] == [0]
+    assert [g.layer_indices for g in spec] == [(0,)]
+    # The ring layer is excluded from all group index mapping.
+    assert get_engine_group_indices(spec, 2) == [0, EXCLUDED_ENGINE_GROUP]
+
+
+def test_conversion_ring_group_keeps_later_engine_group_ids():
+    """Engine group ids of the surviving groups must stay stable even when the
+    ring group sits between them (the engine's per-request block-id lists are
+    keyed by the original vLLM group index)."""
+    caches = _same_shape_caches(["main.0", "ring.0", "main.1"])
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["main.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["ring.0"], CircularBufferSpec(block_size=8)),
+                MockKVCacheGroup(["main.1"], FullAttentionSpec(block_size=32)),
+            ]
+        ),
+        caches,
+    )
+
+    # Ring group is engine group 1 and is excluded; main keeps ids 0 and 2.
+    assert [g.engine_group_id for g in spec] == [0, 2]
+    assert [g.tokens_per_block for g in spec] == [16, 32]
+    assert get_engine_group_indices(spec, 3) == [0, EXCLUDED_ENGINE_GROUP, 2]
+
+
+def test_ring_spec_predicate():
+    """The recognition predicate names exactly the ring class, including a
+    ``UniformTypeKVCacheSpecs`` wrapper whose every leaf is a ring, and never
+    a mixed wrapper (which would wrongly exclude the whole group)."""
+    from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
+        is_circular_buffer_ring_spec,
+    )
+
+    assert is_circular_buffer_ring_spec(CircularBufferSpec(block_size=8)) is True
+    assert is_circular_buffer_ring_spec(FullAttentionSpec(block_size=16)) is False
+    assert is_circular_buffer_ring_spec(MambaSpec(block_size=16)) is False
+    assert is_circular_buffer_ring_spec(None) is False
+
+    all_ring = UniformTypeKVCacheSpecs(
+        block_size=8,
+        kv_cache_specs={
+            "a": CircularBufferSpec(block_size=8),
+            "b": CircularBufferSpec(block_size=8),
+        },
+    )
+    assert is_circular_buffer_ring_spec(all_ring) is True
+
+    mixed = UniformTypeKVCacheSpecs(
+        block_size=8,
+        kv_cache_specs={
+            "a": CircularBufferSpec(block_size=8),
+            "b": FullAttentionSpec(block_size=16),
+        },
+    )
+    assert is_circular_buffer_ring_spec(mixed) is False
+
+
+def test_ring_spec_contradiction_fails_closed():
+    """A ``CircularBufferSpec`` that claims to be cacheable is a contradiction
+    and must fail loudly, never silently allowing the ring to be cached."""
+    from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
+        is_circular_buffer_ring_spec,
+    )
+
+    bad = CircularBufferSpec(block_size=8, prefix_cacheable=True)
+    with pytest.raises(ValueError, match="prefix_cacheable=False"):
+        is_circular_buffer_ring_spec(bad)
