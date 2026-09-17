@@ -13,6 +13,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
+from fractions import Fraction
 from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 import array
 import math
@@ -32,6 +33,31 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
     from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+
+
+def _floor_to_multiple(value: int, unit: int | Fraction) -> int:
+    """Largest multiple of *unit* not exceeding *value*, computed exactly.
+
+    *unit* is an engine-declared block or state span. vLLM's nightly contract
+    types ``tokens_per_state`` as ``int | Fraction``, so this helper avoids
+    float arithmetic entirely: ``//`` and ``*`` on an ``int`` and a
+    ``Fraction`` are exact, and the result of flooring to a multiple is an
+    integer token count, hence the ``int`` coercion.
+
+    Args:
+        value: Non-negative token count to floor.
+        unit: Positive block or state span in tokens (``int`` or ``Fraction``).
+
+    Returns:
+        The largest multiple of *unit* that is ``<= value``.
+
+    Raises:
+        ValueError: If *unit* is not positive.
+    """
+    if unit <= 0:
+        raise ValueError(f"alignment unit {unit} must be positive")
+    return int(value // unit * unit)
+
 
 
 class BaseCacheContext(ABC):
@@ -509,11 +535,22 @@ class BaseCacheContext(ABC):
         A ``tokens_per_state>1`` group stores one physical slot per
         ``tokens_per_state`` logical tokens, so only group-boundary tokens
         are valid: serving a length that is not a state boundary would cut a
-        stored state in half. This returns the number of whole states each
-        group commits at the aligned length, exactly
-        ``aligned_tokens * slots_per_block // tokens_per_block`` (an integer
-        whenever the group's ``tokens_per_block`` divides the alignment, and
-        floored per group otherwise).
+        stored state in half. The cross-group aligned length is first floored
+        to this group's own state boundary, then converted to a state count:
+        ``aligned_tokens * slots_per_block // tokens_per_block`` (equivalently
+        ``aligned_tokens // tokens_per_state`` whenever the geometry is
+        consistent).
+
+        The state floor is applied **per group on the cross-group aligned
+        length**, independently of the ``include`` mask used to compute that
+        alignment. A group excluded from ``include`` does not constrain the
+        alignment, so its own block grid must not shrink its reported count:
+        e.g. a ``tokens_per_block=64``, ``tokens_per_state=2`` group outside
+        the mask at ``aligned=96`` must report ``96 // 2 = 48`` whole states,
+        not ``64 // 2 = 32``. For a group that does participate, the lcm
+        already makes ``aligned`` a multiple of its ``tokens_per_block``.
+        Applying the state floor when ``tokens_per_state == 1`` is the
+        identity.
 
         Args:
             hit_length: Candidate hit length in logical tokens.
@@ -534,13 +571,27 @@ class BaseCacheContext(ABC):
         for idx, group in enumerate(self.kv_layer_groups_manager.kernel_groups):
             tokens_per_block = group.tokens_per_block
             slots_per_block = group.slots_per_block
+            tokens_per_state = group.tokens_per_state
             if tokens_per_block <= 0 or slots_per_block <= 0:
                 raise ValueError(
                     f"kernel group {idx}: non-positive geometry "
                     f"tokens_per_block={tokens_per_block}, "
                     f"slots_per_block={slots_per_block}"
                 )
-            group_aligned = aligned // tokens_per_block * tokens_per_block
+            if tokens_per_state <= 0:
+                raise ValueError(
+                    f"kernel group {idx}: non-positive tokens_per_state "
+                    f"{tokens_per_state}"
+                )
+            # Floor to this group's own *state* boundary. The block grid is
+            # deliberately not used here: when the group participates in
+            # ``include`` the cross-group lcm already makes ``aligned`` a
+            # multiple of its ``tokens_per_block`` (so a block floor would be
+            # the identity), and when it does not participate its block grid
+            # must not shrink the reported count below the whole states that
+            # fit in ``aligned``. Applying the state floor is the identity
+            # for ``tokens_per_state == 1``.
+            group_aligned = _floor_to_multiple(aligned, tokens_per_state)
             states.append(group_aligned * slots_per_block // tokens_per_block)
         return states
 

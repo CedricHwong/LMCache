@@ -16,7 +16,7 @@ corresponding ``lmcache.integration.<engine>`` package, not here.
 """
 
 # Standard
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import lcm
 from typing import Protocol, cast
@@ -521,6 +521,51 @@ class GroupBlockMask:
         return self.blocks[block_index - self.start_block]
 
 
+def lcm_cacheable_block_tokens(
+    group_spans: Iterable[tuple[int, bool]],
+) -> int:
+    """Cross-group block lcm over the participating ``(span, cacheable)`` pairs.
+
+    This is the **single source of truth** for the hit-length alignment: the
+    engine-neutral group view (:func:`lcm_block_tokens`, which reads the
+    per-group descriptors) and the vLLM connector's
+    ``LMCacheMPConnector._hit_alignment_tokens`` (which only has the raw
+    engine-group block spans plus each spec's ``prefix_cacheable`` flag) both
+    funnel through it. Sharing the filter matters because the two call sites
+    otherwise disagree whenever a non-cacheable group's block span does not
+    divide the cacheable lcm: with spans ``[32, 64, 48]`` where ``48`` is the
+    non-cacheable ring, the unfiltered lcm is ``192`` while the cacheable one
+    is ``64`` — a silent 3x fork in how far a hit length is trimmed.
+
+    Args:
+        group_spans: ``(tokens_per_block, prefix_cacheable)`` pairs, one per
+            group. ``tokens_per_block`` is the group's logical block span in
+            tokens; non-positive spans are ignored.
+
+    Returns:
+        ``lcm(tokens_per_block)`` over the pairs that are ``prefix_cacheable``
+        with a positive ``tokens_per_block``.
+
+    Raises:
+        ValueError: If no participating group reports a positive
+            ``tokens_per_block`` (a mask requires a concrete block grid).
+    """
+    block_sizes = [
+        int(tokens_per_block)
+        for tokens_per_block, cacheable in group_spans
+        if cacheable and tokens_per_block > 0
+    ]
+    if not block_sizes:
+        raise ValueError(
+            "cannot compute the cross-group block lcm: no prefix_cacheable "
+            "group reports a positive tokens_per_block"
+        )
+    result = 1
+    for block_size in block_sizes:
+        result = lcm(result, block_size)
+    return result
+
+
 def lcm_block_tokens(groups: Sequence[MaskGroup]) -> int:
     """Cross-group block-size common multiple (Mooncake's ``lcm_block_size``).
 
@@ -541,20 +586,9 @@ def lcm_block_tokens(groups: Sequence[MaskGroup]) -> int:
         ValueError: If no participating group reports a positive
             ``tokens_per_block`` (a mask requires a concrete block grid).
     """
-    block_sizes = [
-        group.tokens_per_block
-        for group in groups
-        if group.prefix_cacheable and group.tokens_per_block > 0
-    ]
-    if not block_sizes:
-        raise ValueError(
-            "cannot compute the cross-group block lcm: no prefix_cacheable "
-            "group reports a positive tokens_per_block"
-        )
-    result = 1
-    for block_size in block_sizes:
-        result = lcm(result, block_size)
-    return result
+    return lcm_cacheable_block_tokens(
+        (group.tokens_per_block, bool(group.prefix_cacheable)) for group in groups
+    )
 
 
 def align_lookup_length(groups: Sequence[MaskGroup], length: int) -> int:

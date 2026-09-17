@@ -46,6 +46,7 @@
 
 # Standard
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 # Third Party
 import pytest
@@ -612,6 +613,60 @@ class TestHitLengthPhysicalStates:
         assert states == [256] * 8 + [128, 128, 256, 256]
         states_192 = ctx.hit_length_physical_states(192)
         assert states_192 == [192] * 8 + [96, 96, 192, 192]
+
+    def test_include_mask_keeps_whole_states_for_excluded_tps2_group(self) -> None:
+        """W2：include 只选部分组时，tps>1 组仍按 ``aligned/tps`` 报整态。
+
+        10 组生产几何（8×32/tps=1 + 2×64/tps=2），``include`` 只选第 0 组
+        ⇒ lcm=32。``hit=96`` 对齐到 96；tps=2 组（tpb=64, slots=32）的物理
+        整态数应为 ``96*32//64 = 48``。修复前该函数先按自身 tpb=64 落格到 64，
+        少报成 32（≈ -33%）。
+        """
+        ctx = self._ctx(_prod_lmcache_groups()[:10])
+        include = [True] + [False] * 9
+        assert ctx.group_lcm_block_size(include) == 32
+        states = ctx.hit_length_physical_states(96, include)
+        assert ctx.align_hit_length(96, include) == 96
+        assert states[8] == 48
+        assert states[9] == 48
+
+    def test_include_mask_aligned_and_unaligned_hits(self) -> None:
+        """W2：对齐/不对齐 hit 的整态数（aligned 64→32、96→48、128→64）。"""
+        ctx = self._ctx(_prod_lmcache_groups()[:10])
+        include = [True] + [False] * 9
+        assert ctx.hit_length_physical_states(64, include)[8] == 32
+        assert ctx.hit_length_physical_states(96, include)[8] == 48
+        assert ctx.hit_length_physical_states(128, include)[8] == 64
+        # hit=97 floors to the same 96 alignment -> identical whole states.
+        states_96 = ctx.hit_length_physical_states(96, include)
+        assert ctx.hit_length_physical_states(97, include) == states_96
+
+    def test_include_mask_leaves_tps1_groups_unchanged(self) -> None:
+        """W2 的 tps floor 对 tps=1 组是恒等：整态数 == aligned。"""
+        ctx = self._ctx(_prod_lmcache_groups()[:10])
+        include = [True] + [False] * 9
+        assert ctx.hit_length_physical_states(96, include)[:8] == [96] * 8
+
+    def test_fractional_tokens_per_state_is_exact(self) -> None:
+        """Fraction 的 state floor 走精确有理数运算（无浮点误差），且返回 int。"""
+        # First Party
+        from lmcache.v1.platform.base.cache_context import _floor_to_multiple
+
+        assert _floor_to_multiple(96, Fraction(3, 2)) == 96
+        assert _floor_to_multiple(64, Fraction(3, 2)) == 63
+        assert isinstance(_floor_to_multiple(64, Fraction(3, 2)), int)
+        # float(64 // 1.5) * 1.5 would land at 63.0 only by luck; exactness of
+        # the helper is what keeps downstream state counts integral.
+        assert _floor_to_multiple(100, Fraction(1, 3)) == 100
+
+    def test_fractional_tokens_per_state_through_helper(self) -> None:
+        """Fraction tps 经真实 helper：aligned=64 → floor(3/2)=63 → 41 整态。"""
+        ctx = self._ctx(
+            [EngineGroupInfo(0, tokens_per_block=64, tokens_per_state=Fraction(3, 2))]
+        )
+        states = ctx.hit_length_physical_states(64)
+        assert states == [41]
+        assert all(isinstance(state, int) for state in states)
 
 
 # ============================================================================

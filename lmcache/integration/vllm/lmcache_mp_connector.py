@@ -43,6 +43,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 )
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    get_group_prefix_cacheable,
     get_tokens_per_block,
 )
 from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
@@ -62,6 +63,7 @@ from lmcache.integration.vllm.utils import (
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.group_view import lcm_cacheable_block_tokens
 
 try:
     # First Party
@@ -488,6 +490,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         group_tokens_per_block = get_group_tokens_per_block(
             vllm_config, kv_cache_config
         )
+        group_prefix_cacheable = get_group_prefix_cacheable(kv_cache_config)
+        if len(group_prefix_cacheable) != len(group_tokens_per_block):
+            raise ValueError(
+                "group prefix-cacheable mask "
+                f"({len(group_prefix_cacheable)} entries) does not match the "
+                f"group block spans ({len(group_tokens_per_block)} entries)"
+            )
         scheduler_block_size = get_vllm_scheduler_block_size(
             vllm_config, kv_cache_config
         )
@@ -651,6 +660,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
         self._group_tokens_per_block = group_tokens_per_block
+        self._group_prefix_cacheable = group_prefix_cacheable
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
@@ -659,9 +669,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     f"group {engine_group_idx} tokens_per_block "
                     f"{tokens_per_block} must be positive"
                 )
-        # Smallest token count aligned to every group's paged-chunk
-        # boundary; used to round down vLLM APC hit counts.
-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
+        # Smallest token count aligned to every *prefix-cacheable* group's
+        # paged-chunk boundary; used to round down vLLM APC hit counts. This
+        # is the same fact as ``group_view.lcm_block_tokens`` (cacheable-only)
+        # so the connector and the engine-neutral mask API cannot fork when a
+        # non-cacheable group's block span does not divide the cacheable lcm.
+        self._hit_alignment_tokens = lcm_cacheable_block_tokens(
+            zip(self._group_tokens_per_block, self._group_prefix_cacheable)
+        )
         if self.role == KVConnectorRole.SCHEDULER:
             # Chunk boundaries must land on every group's paged-chunk
             # boundary so per-group block-id slicing stays aligned.

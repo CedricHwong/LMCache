@@ -276,6 +276,13 @@ class UniformTypeKVCacheSpecs:
     kv_cache_specs: dict = field(default_factory=dict)
 
 
+@dataclass
+class CircularBufferAttentionSpec(AttentionSpec):
+    """Double for a non-cacheable attention spec (V4.1 compressor ring)."""
+
+    prefix_cacheable: bool = False
+
+
 def _attention_spec(block_size: int) -> AttentionSpec:
     """Build an attention spec double so the MRO-name check is exercised."""
     return FullAttentionSpec(block_size=block_size)
@@ -327,6 +334,58 @@ def _import_connector_geometry_helpers():
         get_dcp_decorated_model_name,
         get_vllm_scheduler_block_size,
         validate_mamba_step_alignment,
+    )
+
+
+def _import_hit_alignment_helpers():
+    """Import the W3 single-source alignment helpers (no vLLM import needed)."""
+    # First Party
+    from lmcache.integration.vllm.kv_cache_groups import get_group_prefix_cacheable
+    from lmcache.v1.multiprocess.group_view import (
+        EngineGroupInfo,
+        lcm_block_tokens,
+        lcm_cacheable_block_tokens,
+    )
+
+    return (
+        get_group_prefix_cacheable,
+        lcm_block_tokens,
+        lcm_cacheable_block_tokens,
+        EngineGroupInfo,
+    )
+
+
+def _connector_alignment(
+    spans: list[int],
+    cacheable: list[bool],
+    lcm_cacheable_block_tokens,
+) -> int:
+    """Reproduce what ``LMCacheMPConnector`` computes for ``_hit_alignment_tokens``.
+
+    The connector pairs its resolved engine-group block spans with
+    :func:`get_group_prefix_cacheable` and funnels them through the shared
+    :func:`lcm_cacheable_block_tokens`; this helper keeps the test free of a
+    vLLM import while exercising the same composition.
+    """
+    return lcm_cacheable_block_tokens(zip(spans, cacheable))
+
+
+def _geometry_kv_cache_config(
+    spans: list[int],
+    cacheable: list[bool],
+) -> SimpleNamespace:
+    """Resolved groups with explicit per-group block spans and cacheability."""
+    return SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=(
+                    _attention_spec(span)
+                    if is_cacheable
+                    else CircularBufferAttentionSpec(block_size=span)
+                )
+            )
+            for span, is_cacheable in zip(spans, cacheable)
+        ]
     )
 
 
@@ -395,6 +454,126 @@ def test_scheduler_block_size_is_group_span_lcm():
 
     assert get_group_tokens_per_block(config, kv_config) == [12, 18]
     assert get_vllm_scheduler_block_size(config, kv_config) == 36
+
+
+@requires_vllm
+def test_v41_ring_keeps_hit_alignment_at_64_in_both_sources():
+    """W3 不变量：V4.1 生产几何（8×32 + 64 + ring 8）下两事实源都是 64。"""
+    # Standard
+    import math
+
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import (
+        get_group_tokens_per_block,
+    )
+
+    (
+        get_group_prefix_cacheable,
+        lcm_block_tokens,
+        lcm_cacheable_block_tokens,
+        EngineGroupInfo,
+    ) = _import_hit_alignment_helpers()
+
+    spans = [32] * 8 + [64] + [8]
+    cacheable = [True] * 9 + [False]
+    config = _geometry_config(dcp_size=1)
+    kv_config = _geometry_kv_cache_config(spans, cacheable)
+
+    assert get_group_tokens_per_block(config, kv_config) == spans
+    assert get_group_prefix_cacheable(kv_config) == cacheable
+    # Unfiltered lcm happens to coincide here (the ring block divides 64).
+    assert math.lcm(*spans) == 64
+
+    groups = [
+        EngineGroupInfo(i, tokens_per_block=span, prefix_cacheable=flag)
+        for i, (span, flag) in enumerate(zip(spans, cacheable))
+    ]
+    assert lcm_block_tokens(groups) == 64
+    assert _connector_alignment(spans, cacheable, lcm_cacheable_block_tokens) == 64
+
+
+def test_non_cacheable_ring_no_longer_forks_hit_alignment():
+    """W3 分叉几何：ring block=48 时未过滤 lcm=192、cacheable=64。
+
+    连接器（共享 ``lcm_cacheable_block_tokens``）与 new API
+    ``lcm_block_tokens`` 都取 64，不再差 3 倍。
+    """
+    # Standard
+    import math
+
+    (
+        get_group_prefix_cacheable,
+        lcm_block_tokens,
+        lcm_cacheable_block_tokens,
+        EngineGroupInfo,
+    ) = _import_hit_alignment_helpers()
+
+    spans = [32, 32, 64, 48]
+    cacheable = [True, True, True, False]
+    kv_config = _geometry_kv_cache_config(spans, cacheable)
+
+    assert get_group_prefix_cacheable(kv_config) == cacheable
+    # The pre-fix connector formula forks: lcm over all groups is 192.
+    assert math.lcm(*spans) == 192
+
+    groups = [
+        EngineGroupInfo(i, tokens_per_block=span, prefix_cacheable=flag)
+        for i, (span, flag) in enumerate(zip(spans, cacheable))
+    ]
+    connector_alignment = _connector_alignment(
+        spans, cacheable, lcm_cacheable_block_tokens
+    )
+    assert lcm_block_tokens(groups) == 64
+    assert connector_alignment == lcm_block_tokens(groups) == 64
+
+
+def test_v41_ring_keeps_alignment_when_vllm_groups_provide_flags():
+    """W3 不变量（无 vLLM）：V4.1 几何下连接器组合值 == new API == 64。"""
+    # Standard
+    import math
+
+    (
+        get_group_prefix_cacheable,
+        lcm_block_tokens,
+        lcm_cacheable_block_tokens,
+        EngineGroupInfo,
+    ) = _import_hit_alignment_helpers()
+
+    spans = [32] * 8 + [64] + [8]
+    cacheable = [True] * 9 + [False]
+    kv_config = _geometry_kv_cache_config(spans, cacheable)
+
+    assert get_group_prefix_cacheable(kv_config) == cacheable
+    assert math.lcm(*spans) == 64
+    groups = [
+        EngineGroupInfo(i, tokens_per_block=span, prefix_cacheable=flag)
+        for i, (span, flag) in enumerate(zip(spans, cacheable))
+    ]
+    assert lcm_block_tokens(groups) == 64
+    assert _connector_alignment(spans, cacheable, lcm_cacheable_block_tokens) == 64
+
+
+def test_group_prefix_cacheable_defaults_and_legacy_fallback():
+    """W3 读取器：缺失字段视为 cacheable，无组元数据回落单组 ``[True]``。"""
+    get_group_prefix_cacheable, _, _, _ = _import_hit_alignment_helpers()
+
+    legacy = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=_attention_spec(64))]
+    )
+    assert get_group_prefix_cacheable(legacy) == [True]
+    assert get_group_prefix_cacheable(None) == [True]
+    assert get_group_prefix_cacheable(SimpleNamespace(kv_cache_groups=[])) == [True]
+
+
+def test_lcm_cacheable_block_tokens_ignores_non_cacheable_pairs():
+    """共享实现的直接单测：非 cacheable / 非正 span 不参与 lcm。"""
+    # First Party
+    from lmcache.v1.multiprocess.group_view import lcm_cacheable_block_tokens
+
+    assert lcm_cacheable_block_tokens([(32, True), (64, True), (48, False)]) == 64
+    assert lcm_cacheable_block_tokens([(32, True), (0, True), (48, False)]) == 32
+    with pytest.raises(ValueError, match="no prefix_cacheable group"):
+        lcm_cacheable_block_tokens([(32, False), (48, False)])
 
 
 @requires_vllm

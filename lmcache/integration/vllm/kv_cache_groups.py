@@ -210,6 +210,45 @@ def read_v41_spec_fields(spec: Any) -> dict[str, Any]:
     return per_leaf[0]
 
 
+def get_group_prefix_cacheable(kv_cache_config: Any) -> list[bool]:
+    """Return whether each KV cache group participates in prefix caching.
+
+    Read from ``group.kv_cache_spec.prefix_cacheable`` (a vLLM property that
+    is ``all(...)`` over the leaves of a ``UniformTypeKVCacheSpecs`` wrapper),
+    so a non-cacheable group -- e.g. the V4.1 compressor ring -- is excluded
+    from the hit-length alignment. This is the connector-side half of the
+    single source of truth for that alignment: the block spans come from
+    :func:`get_tokens_per_block` and the lcm is computed by
+    :func:`lmcache.v1.multiprocess.group_view.lcm_cacheable_block_tokens`,
+    which applies exactly this ``prefix_cacheable`` filter. When vLLM
+    provides no group metadata, preserve the legacy single-group rule
+    (cacheable).
+
+    Every read goes through ``getattr`` with a default, so a nightly/older
+    field layout without ``prefix_cacheable`` counts as cacheable instead of
+    raising.
+
+    Args:
+        kv_cache_config: vLLM's resolved KV cache group configuration; may be
+            ``None`` when the engine supplied no metadata.
+
+    Returns:
+        One boolean per KV cache group, in engine group order (``[True]`` for
+        the legacy single-group case).
+    """
+    groups = (
+        getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+        if kv_cache_config is not None
+        else ()
+    )
+    if not groups:
+        return [True]
+    return [
+        bool(getattr(getattr(group, "kv_cache_spec", None), "prefix_cacheable", True))
+        for group in groups
+    ]
+
+
 def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
