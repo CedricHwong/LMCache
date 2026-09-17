@@ -6,6 +6,15 @@ pure-torch gather, and writing it back into a zeroed pool (H2D) must
 restore the original bytes. Exercises the inflated per-block step that
 distinguishes a blocks-first pool from a layer-compact cache: the step
 rides in block_stride_elems, taken from the views' stride(0).
+
+``head_size`` is taken from the detected spec (``KVFormatSpec.head_size()``),
+i.e. the *full* per-head content width ``CS`` -- exactly what the production
+connector forwards. The CS branch of ``page_buffer_offset`` used to derive an
+internal ``hs2 = 2 * head_size``; this test compensated by passing ``CS // 2``
+so that ``2 * (CS // 2) == CS`` reproduced the true width. That workaround is
+gone with the C++ fix: the kernel now decomposes by the width it is given, so
+passing ``CS // 2`` halves the real head width and corrupts the token/head
+addressing.
 """
 
 # Third Party
@@ -15,6 +24,7 @@ import torch
 # First Party
 from lmcache import device_ops
 from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector import utils as gpu_connector_utils
 from lmcache.v1.gpu_connector.kv_format import detect_format
 import lmcache.lmcache_native as lmcache_native
 
@@ -73,6 +83,12 @@ def test_kernel_roundtrip_matches_torch(order, pad_layers):
     )
     assert fmt == expected_fmt
     assert kv[0].stride(0) == buf.stride(0)
+    # Full per-head content width, as the production connector forwards it:
+    # kv_format specs define ``head_size() == shape[-1] == CS`` (K/V packed),
+    # and the fixed CS kernel branch decomposes by exactly this width. Assert
+    # it equals CS so the test cannot silently drift to the pre-fix CS // 2.
+    head_size = gpu_connector_utils.get_head_size(kv, fmt)
+    assert head_size == CS
     ptrs = torch.tensor([v.data_ptr() for v in kv], dtype=torch.int64, device="cuda")
     # A blocks-first pool always needs its real step: every block packs all
     # layers, so stride(0) exceeds the per-layer tight step even unpadded.
@@ -89,7 +105,7 @@ def test_kernel_roundtrip_matches_torch(order, pad_layers):
         int(lmcache_native.TransferDirection.D2H),
         int(fmt),
         BS,
-        CS // 2,
+        head_size,
         0,
         block_stride,
     )
@@ -110,7 +126,7 @@ def test_kernel_roundtrip_matches_torch(order, pad_layers):
         int(lmcache_native.TransferDirection.H2D),
         int(fmt),
         BS,
-        CS // 2,
+        head_size,
         0,
         block_stride,
     )
