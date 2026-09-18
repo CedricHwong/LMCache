@@ -31,6 +31,7 @@ def _build_manager(
     *,
     engine_group_infos: Sequence[EngineGroupInfo] = (),
     separate_object_groups: bool = False,
+    engine_kv_formats: Sequence[lmcache_native.EngineKVFormat] | None = None,
 ) -> KVLayerGroupsManager:
     """Build a manager using the per-layer NHD format.
 
@@ -41,12 +42,36 @@ def _build_manager(
     """
     # First Party
 
+    if engine_kv_formats is None:
+        engine_kv_formats = [
+            lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+        ] * len(tensors)
+
     return KVLayerGroupsManager(
         tensors,
-        engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS]
-        * len(tensors),
+        engine_kv_formats=list(engine_kv_formats),
         engine_group_infos=engine_group_infos,
         separate_object_groups=separate_object_groups,
+    )
+
+
+def _info_with_state_content_bytes(value: int) -> EngineGroupInfo:
+    """An ``EngineGroupInfo`` declaring ``state_content_bytes``.
+
+    ``EngineGroupInfo`` is a frozen ``msgspec.Struct``, so the field is set
+    through ``msgspec.structs.replace`` rather than by mutation.
+
+    Args:
+        value: The declared per-(head slot, stored state) cell width in bytes.
+
+    Returns:
+        A group info over layer 0 with the declaration attached.
+    """
+    # Third Party
+    import msgspec
+
+    return msgspec.structs.replace(
+        EngineGroupInfo(0, (0,)), state_content_bytes=value
     )
 
 
@@ -95,6 +120,61 @@ class TestDeclaredCompressionWithoutBlockSpan:
                     0, (0,), tokens_per_block=64, tokens_per_state=1
                 )
             ],
+        )
+        assert len(manager.kernel_groups) == 1
+
+
+class TestPageLayoutMatchesSpec:
+    """P1-2: the page-layout decision must agree with the spec's declaration.
+
+    ``discover(kv_caches, layout_hints)`` never sees the KV cache spec, so it
+    picks the blocked-scale format from the record width alone; the only place
+    that holds both the chosen format and the spec is the group builder. If the
+    two disagree one of two silent corruptions follows, so it must fail fast.
+    """
+
+    def test_declared_blocked_scale_with_token_major_format_fails(self) -> None:
+        """584 declared (576 value + 8 scale) but CS chosen -> refuse.
+
+        584 is a known blocked-scale record, so a token-major content-size
+        format would address every token's value bytes as if the scale plane
+        began immediately after them.
+        """
+        with pytest.raises(ValueError, match="blocked-scale record"):
+            _build_manager(
+                [torch.zeros(2, 32, 1, 64, 584, dtype=torch.uint8)],
+                engine_kv_formats=[
+                    lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+                ],
+                engine_group_infos=[
+                    _info_with_state_content_bytes(584),
+                ],
+            )
+
+    def test_matching_blocked_scale_format_builds(self) -> None:
+        """The segregated format with a matching declaration is accepted."""
+        # NL_X_NB_BSV_BSS accepts a 3-D [NB, BS, W] or 4-D [NB, 1, BS, W]
+        # page (a blocked-scale page is single-plane), not the 5-D NHD form
+        # the other tests in this module use.
+        manager = _build_manager(
+            [torch.zeros(32, 1, 64, 584, dtype=torch.uint8)],
+            engine_kv_formats=[
+                lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS
+            ],
+            engine_group_infos=[
+                _info_with_state_content_bytes(584),
+            ],
+        )
+        assert len(manager.kernel_groups) == 1
+
+    def test_undeclared_state_content_bytes_is_not_checked(self) -> None:
+        """``None`` (indexer specs, pre-quantization builds) is not a claim."""
+        manager = _build_manager(
+            [torch.zeros(2, 32, 1, 64, 584, dtype=torch.uint8)],
+            engine_kv_formats=[
+                lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+            ],
+            engine_group_infos=[EngineGroupInfo(0, (0,))],
         )
         assert len(manager.kernel_groups) == 1
 

@@ -541,6 +541,15 @@ class KVLayerGroupsManager:
             prefix_cacheable = info.prefix_cacheable if info is not None else True
             is_eagle_group = info.is_eagle_group if info is not None else False
 
+            self._validate_page_layout_matches_spec(
+                group_idx,
+                group_format=group_format,
+                record_bytes=shape_desc.hs,
+                declared_state_content_bytes=(
+                    info.state_content_bytes if info is not None else None
+                ),
+            )
+
             self._validate_block_chunk_size_config(
                 group_idx,
                 slots_per_block=bs,
@@ -995,6 +1004,98 @@ class KVLayerGroupsManager:
                 key=lambda kv: (kv[0].extra_tag != 0, kv[1][0]),
             )
         ]
+
+    @staticmethod
+    def _validate_page_layout_matches_spec(
+        group_idx: int,
+        group_format: "lmcache_native.EngineKVFormat",
+        record_bytes: int,
+        declared_state_content_bytes: int | None,
+    ) -> None:
+        """Cross-check the selected page layout against the engine's declaration.
+
+        The vLLM detector picks :data:`EngineKVFormat.NL_X_NB_BSV_BSS` for a
+        blocked-scale page, but it only sees the registered *tensors* -- it has
+        no access to the KV cache spec, so it decides from the record width
+        alone (see ``detectors/vllm.py``).  The spec, meanwhile, declares
+        ``state_content_bytes``: vLLM's per-(head slot, stored state) cell
+        width in bytes, which *includes* the scale region
+        (``AttentionSpec.state_content_size_bytes`` feeds
+        ``unpadded_page_size_bytes`` directly).  So for the quantized
+        DeepSeek-V4 MLA page the declaration is the whole per-token record
+        width, and the two must agree.
+
+        This is the only place where both halves are in hand: the format is
+        known (``group_format``) and so is the spec (``EngineGroupInfo``).  If
+        they disagree, one of two silent corruptions follows -- a segregated
+        page addressed token-major, or a token-major page addressed with the
+        segregated ``[BS x vals][BS x scales]`` planes -- so it fails fast
+        instead.  The audit's original wording ("have the *detector* fail fast
+        using ``state_content_bytes``") is not executable, because
+        ``discover(kv_caches, layout_hints)`` never receives the spec;
+        performing it here is the executable form of the same intent.
+
+        Args:
+            group_idx: 0-based kernel group index, for the message.
+            group_format: The ``EngineKVFormat`` selected for this group.
+            record_bytes: The per-token record width read from the tensor
+                (``PageBufferShapeDesc.hs``).
+            declared_state_content_bytes: The engine's declared cell width, or
+                ``None`` when the spec does not declare one (indexer specs and
+                every pre-quantization build leave it unset).
+
+        Raises:
+            ValueError: If the declaration says the page is a known
+                blocked-scale record but the selected format is not
+                ``NL_X_NB_BSV_BSS``; if the selected format is
+                ``NL_X_NB_BSV_BSS`` but the declared width is not a known
+                blocked-scale record; or if the declared width disagrees with
+                the registered record width.
+        """
+        # Local import: ``lmcache.v1.gpu_connector.__init__`` reaches back into
+        # this module (see the comment at the top of this file), so the import
+        # must stay lazy.
+        # First Party
+        from lmcache.v1.gpu_connector.kv_format.specs.nl_x_nb_bsv_bss import (
+            BLOCKED_SCALE_RECORDS,
+            blocked_scale_bytes,
+        )
+
+        if declared_state_content_bytes is None:
+            # Nothing declared: the detector's width-based decision stands.
+            return
+
+        declared = int(declared_state_content_bytes)
+        is_segregated_format = (
+            group_format == lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS
+        )
+        declared_scale = blocked_scale_bytes(declared)
+
+        if declared_scale > 0 and not is_segregated_format:
+            raise ValueError(
+                f"group {group_idx}: the engine declares "
+                f"state_content_bytes={declared}, which is a known "
+                f"blocked-scale record ({declared - declared_scale} value + "
+                f"{declared_scale} scale bytes, segregated per block), but the "
+                f"selected format is {group_format}. The content-size formats "
+                "address such a page token-major and would silently corrupt "
+                "it."
+            )
+        if is_segregated_format and declared_scale == 0:
+            raise ValueError(
+                f"group {group_idx}: format NL_X_NB_BSV_BSS was selected, but "
+                f"the engine declares state_content_bytes={declared}, which is "
+                "not a known blocked-scale record. Known records: "
+                f"{sorted(BLOCKED_SCALE_RECORDS)}."
+            )
+        if declared != int(record_bytes):
+            raise ValueError(
+                f"group {group_idx}: the engine declares "
+                f"state_content_bytes={declared} but the registered tensor's "
+                f"per-token record width is {record_bytes}. The spec and the "
+                "registration disagree; LMCache cannot tell which one the "
+                "bytes actually follow."
+            )
 
     @staticmethod
     def _validate_block_chunk_size_config(

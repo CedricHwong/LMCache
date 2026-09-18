@@ -53,6 +53,8 @@ import pytest
 import torch
 
 # First Party
+from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.utils import normalize_kv_and_discover_format
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
     get_tokens_per_block,
@@ -200,6 +202,11 @@ def _indexer_name(layer: int) -> str:
 def _ring_name(layer: int) -> str:
     """kv-source compressor 状态环的注册张量名。"""
     return f"model.layers.{layer}.compressor.state_cache"
+
+
+# Production registers BLHNC per-layer views ``[B, H, N, C]`` (see the fixture
+# docstring); discovery needs the declaration to pick the block axis.
+HINTS = {"kv_layout": "BLHNC"}
 
 
 def _prod_vllm_config_and_caches() -> tuple[MockKVCacheConfig, dict[str, torch.Tensor]]:
@@ -380,10 +387,24 @@ class TestProdTenGroupMorphology:
             if not k.endswith(".compressor.state_cache")
         }
         tensors = list(cacheable.values())
+        # Use the formats the real detector produces for this geometry rather
+        # than hard-coding one. Hard-coding NL_X_NB_NH_BS_CS made the fixture
+        # self-contradictory: every main/ SWA/indexer tensor here is a rank-4
+        # [NB, 1, BS, W] page whose width (584 / 132) *is* a known blocked-scale
+        # record, so discovery routes all of them to NL_X_NB_BSV_BSS -- a
+        # content-size format would address a segregated page token-major. The
+        # manager now cross-checks that against the spec's declared
+        # state_content_bytes and refuses the mismatch, which is exactly what
+        # this hard-coded format was tripping.
+        detected_formats = [
+            normalize_kv_and_discover_format(
+                [t], EngineType.VLLM, layout_hints=HINTS
+            )[0]
+            for t in tensors
+        ]
         manager = KVLayerGroupsManager(
             tensors,
-            engine_kv_formats=[lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS]
-            * len(tensors),
+            engine_kv_formats=detected_formats,
             engine_group_infos=infos,
             lmcache_tokens_per_chunk=256,
         )
