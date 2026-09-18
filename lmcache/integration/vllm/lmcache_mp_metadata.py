@@ -195,6 +195,7 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        group_prefix_cacheable: list[bool] | None = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -206,8 +207,21 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+        group_prefix_cacheable: per-engine-group flag telling whether the
+                group holds a reusable *prefix* of the sequence. A
+                non-cacheable group (e.g. the V4.1 compressor ring, span 8,
+                which never holds more than one block) does not bound how far
+                a prefix can be stored. ``None`` means "all cacheable",
+                preserving the legacy single-group rule.
         """
         num_engine_groups = len(group_tokens_per_block)
+        if group_prefix_cacheable is None:
+            group_prefix_cacheable = [True] * num_engine_groups
+        if len(group_prefix_cacheable) != num_engine_groups:
+            raise ValueError(
+                f"group_prefix_cacheable has {len(group_prefix_cacheable)} "
+                f"entries but there are {num_engine_groups} engine groups"
+            )
         # NOTE: the invariant here is that `num_stored_tokens` should
         # always be a multiple of `lmcache_tokens_per_chunk`
         # TODO: This should be checked every time we update the num_stored_tokens
@@ -237,15 +251,22 @@ class LMCacheMPRequestMetadata:
         # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
         # 16-token full-attention ID).
         allocated_lengths = tracker.num_allocated_blocks()
-        allocated_tokens = (
-            min(
-                allocated_lengths.get(engine_group_idx, 0)
-                * group_tokens_per_block[engine_group_idx]
-                for engine_group_idx in range(num_engine_groups)
-            )
-            if num_engine_groups > 0
-            else 0
-        )
+        # Only prefix-cacheable groups bound the storable prefix. A
+        # non-cacheable group -- the V4.1 compressor ring is the concrete
+        # case -- holds a fixed-size compressor state rather than a prefix of
+        # the sequence, so it can never cover more than its own span (one
+        # block, 8 tokens). Including it here collapses the bound to 8 tokens
+        # and, since 8 < any sane chunk size, silently disables storing for
+        # every request. That is the same ``prefix_cacheable`` filter the
+        # hit-length alignment already applies through
+        # ``lcm_cacheable_block_tokens``.
+        cacheable_spans = [
+            allocated_lengths.get(engine_group_idx, 0)
+            * group_tokens_per_block[engine_group_idx]
+            for engine_group_idx in range(num_engine_groups)
+            if group_prefix_cacheable[engine_group_idx]
+        ]
+        allocated_tokens = min(cacheable_spans) if cacheable_spans else 0
         min_available_tokens = min(
             len(tracker.all_token_ids),
             allocated_tokens,

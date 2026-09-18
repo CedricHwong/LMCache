@@ -1473,6 +1473,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._group_prefix_cacheable,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1506,6 +1507,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._group_prefix_cacheable,
             )
 
             if r_meta is not None:
