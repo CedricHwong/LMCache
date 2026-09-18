@@ -162,7 +162,7 @@ class KVFormatSpec(ABC):
     # per-request compressor ring (``CircularBufferSpec``), whose tensors are
     # shape-indistinguishable from a real pool. That ring group must be
     # excluded by the vLLM group builder from the engine declaration
-    # (``is_circular_buffer_ring_spec`` in ``kv_format.detectors.vllm``)
+    # (``is_non_prefix_cacheable_spec`` in ``kv_format.detectors.vllm``)
     # BEFORE any spec is constructed -- a format-level fact could not tell it
     # apart and would silently bless the wrong bytes.
 

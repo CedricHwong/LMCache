@@ -27,6 +27,7 @@ from lmcache.v1.gpu_connector.utils import (
     get_concrete_engine_kv_shape_from_shape_desc,
     get_engine_kv_shape_description,
 )
+from lmcache.v1.multiprocess.group_view import lcm_cacheable_block_tokens
 import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
@@ -453,13 +454,23 @@ class BaseCacheContext(ABC):
             ]
         if not tokens_per_blocks:
             return 1
+        # Fail fast *before* delegating: the shared helper ignores a
+        # non-positive span, and silently dropping one would shrink the lcm
+        # (an under-aligned hit length cuts a block).
         for tokens_per_block in tokens_per_blocks:
             if tokens_per_block <= 0:
                 raise ValueError(
                     f"non-positive tokens_per_block {tokens_per_block} in a "
                     "selected group; the cross-group alignment is undefined"
                 )
-        return math.lcm(*tokens_per_blocks)
+        # Delegate the arithmetic to the single source of truth. This path used
+        # to call ``math.lcm`` directly, which made it a third independent lcm
+        # implementation alongside ``lcm_cacheable_block_tokens`` (the declared
+        # authority, used by the vLLM connector) and ``lcm_block_tokens``.
+        # Sharing the helper is what keeps the two from forking silently.
+        return lcm_cacheable_block_tokens(
+            (tokens_per_block, True) for tokens_per_block in tokens_per_blocks
+        )
 
     def align_hit_length(
         self, hit_length: int, include: Sequence[bool] | None = None

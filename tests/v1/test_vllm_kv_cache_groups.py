@@ -546,13 +546,13 @@ def test_ring_spec_predicate():
     ``UniformTypeKVCacheSpecs`` wrapper whose every leaf is a ring, and never
     a mixed wrapper (which would wrongly exclude the whole group)."""
     from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
-        is_circular_buffer_ring_spec,
+        is_non_prefix_cacheable_spec,
     )
 
-    assert is_circular_buffer_ring_spec(CircularBufferSpec(block_size=8)) is True
-    assert is_circular_buffer_ring_spec(FullAttentionSpec(block_size=16)) is False
-    assert is_circular_buffer_ring_spec(MambaSpec(block_size=16)) is False
-    assert is_circular_buffer_ring_spec(None) is False
+    assert is_non_prefix_cacheable_spec(CircularBufferSpec(block_size=8)) is True
+    assert is_non_prefix_cacheable_spec(FullAttentionSpec(block_size=16)) is False
+    assert is_non_prefix_cacheable_spec(MambaSpec(block_size=16)) is False
+    assert is_non_prefix_cacheable_spec(None) is False
 
     all_ring = UniformTypeKVCacheSpecs(
         block_size=8,
@@ -561,7 +561,7 @@ def test_ring_spec_predicate():
             "b": CircularBufferSpec(block_size=8),
         },
     )
-    assert is_circular_buffer_ring_spec(all_ring) is True
+    assert is_non_prefix_cacheable_spec(all_ring) is True
 
     mixed = UniformTypeKVCacheSpecs(
         block_size=8,
@@ -570,16 +570,16 @@ def test_ring_spec_predicate():
             "b": FullAttentionSpec(block_size=16),
         },
     )
-    assert is_circular_buffer_ring_spec(mixed) is False
+    assert is_non_prefix_cacheable_spec(mixed) is False
 
 
 def test_ring_spec_contradiction_fails_closed():
     """A ``CircularBufferSpec`` that claims to be cacheable is a contradiction
     and must fail loudly, never silently allowing the ring to be cached."""
     from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
-        is_circular_buffer_ring_spec,
+        is_non_prefix_cacheable_spec,
     )
 
     bad = CircularBufferSpec(block_size=8, prefix_cacheable=True)
     with pytest.raises(ValueError, match="prefix_cacheable=False"):
-        is_circular_buffer_ring_spec(bad)
+        is_non_prefix_cacheable_spec(bad)

@@ -337,6 +337,7 @@ def gather_paged_kv_to_cpu(
         get_num_layers,
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
+        resolve_block_stride_and_log_layout,
     )
 
     tensors = list(kv_caches.values())
@@ -361,6 +362,17 @@ def gather_paged_kv_to_cpu(
     num_chunks = len(block_ids) // blocks_per_chunk
     chunk_tokens = blocks_per_chunk * block_size
 
+    # The physical per-block stride must be carried through: for a dim-0-padded
+    # pool (e.g. a compressed DeepSeek-V4 compressor/indexer cache sharing a row
+    # width with a larger group) the kernel's tight-stride fallback would step
+    # into the padding and read or write the wrong bytes. Passing ``None`` for
+    # unpadded pools is still correct -- the resolver returns ``None`` there.
+    block_stride_elems = resolve_block_stride_and_log_layout(
+        normalized,
+        engine_kv_format,
+        layer_idx=0,
+        group_idx=0,
+    )
     shape_desc = make_page_buffer_shape_desc(
         normalized,
         engine_kv_format,
@@ -368,6 +380,7 @@ def gather_paged_kv_to_cpu(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=block_stride_elems,
     )
 
     iter_indices = (
@@ -582,6 +595,7 @@ def scatter_cpu_to_paged_kv(
         get_num_layers,
         make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
+        resolve_block_stride_and_log_layout,
     )
 
     if not chunks:
@@ -627,6 +641,17 @@ def scatter_cpu_to_paged_kv(
         )
     skip_prefix_n_blocks = skip_first_n_tokens // block_size
 
+    # The physical per-block stride must be carried through: for a dim-0-padded
+    # pool (e.g. a compressed DeepSeek-V4 compressor/indexer cache sharing a row
+    # width with a larger group) the kernel's tight-stride fallback would step
+    # into the padding and read or write the wrong bytes. Passing ``None`` for
+    # unpadded pools is still correct -- the resolver returns ``None`` there.
+    block_stride_elems = resolve_block_stride_and_log_layout(
+        normalized,
+        engine_kv_format,
+        layer_idx=0,
+        group_idx=0,
+    )
     shape_desc = make_page_buffer_shape_desc(
         normalized,
         engine_kv_format,
@@ -634,6 +659,7 @@ def scatter_cpu_to_paged_kv(
         num_layers_in_group=num_layers,
         num_blocks=num_blocks,
         block_size=block_size,
+        block_stride_elems=block_stride_elems,
     )
 
     selected_block_ids: list[int] = []

@@ -10,16 +10,22 @@ truth for which :class:`EngineKVFormat` a per-layer cache has. Byte geometry
 (sizes, strides) is used only to *assert* the declaration matches the
 registered tensors, never to pick the format, and every fallback path warns.
 
-One cache is *not* transferable even though its bytes look like a valid pool:
-the DeepSeek-V4.1 compressor circular-buffer ring (``CircularBufferSpec``).
-Its per-layer tensor is shape-indistinguishable from a compressed-MLA pool, so
-detection alone can never tell it apart -- only the vLLM *spec* declares it
-non-cacheable (``prefix_cacheable=False``, ``uses_slot_mapping=False``). The
-recognition predicate :func:`is_circular_buffer_ring_spec` below is the
-single version-tolerant place that reads that declaration; the vLLM group
-builders use it to exclude the ring group from LMCache KV groups up-front (see
-``lmcache.integration.vllm.kv_cache_groups``) so it is never silently stored
-as if it were request-reusable prefix KV.
+Some caches are *not* transferable even though their bytes look like a valid
+pool: the engine's per-request scratch. The DeepSeek-V4.1 compressor ring
+(``CircularBufferSpec``) is the one that appears in production today, but vLLM
+declares several others the same way -- ``KpoolTailSpec`` (one-block circular
+scratch for a kpool indexer's raw tail, structurally an ordinary
+``SlidingWindowSpec``) and the HiSparse pools. Their per-layer tensors are
+shape-indistinguishable from a real, reusable pool, so detection alone can
+never tell them apart -- only the vLLM *spec* declares them non-cacheable
+(``prefix_cacheable=False``). The recognition predicate
+:func:`is_non_prefix_cacheable_spec` below is the single version-tolerant place
+that reads that declaration; the vLLM group builders use it to exclude such
+groups from LMCache KV groups up-front (see
+``lmcache.integration.vllm.kv_cache_groups``) so they are never silently stored
+as if they were request-reusable prefix KV. It keys on the declaration rather
+than the class name precisely so that a spec LMCache has never heard of is
+still excluded.
 """
 
 # mypy: disable-error-code="union-attr"
@@ -64,32 +70,99 @@ _HEADS_OUTERMOST_LAYOUTS = frozenset(("LHBNC", "BHLNC"))
 _BLOCKS_FIRST_LAYOUTS = frozenset(("BLHNC", "BLNHC"))
 
 
-def _is_circular_buffer_ring_class(spec: Any) -> bool:
-    """Return whether a vLLM KV cache spec is a ``CircularBufferSpec``.
+# vLLM spec class names that are per-request scratch *by definition*, i.e.
+# vLLM hard-codes ``prefix_cacheable = False`` for them.  Kept only as a
+# contradiction guard: the exclusion decision itself is read from the
+# declaration (so an unknown future spec is covered), but if one of these ever
+# declares itself cacheable the two signals disagree and LMCache refuses to
+# guess.  ``KpoolTailSpec`` extends ``SlidingWindowSpec``, so it is
+# structurally an ordinary sliding-window group -- the name list is what lets
+# that case be caught rather than silently stored.
+_KNOWN_SCRATCH_SPEC_CLASSES = frozenset(
+    {
+        "CircularBufferSpec",
+        "KpoolTailSpec",
+        "HiSparseHotSpec",
+        "HiSparseResidentSpec",
+    }
+)
 
-    Checked by class name so this module stays importable without vLLM (the
-    same convention the vLLM group builder uses for sliding-window / Mamba
-    specs). ``CircularBufferSpec`` overrides ``prefix_cacheable`` to always
-    return ``False`` and ``uses_slot_mapping`` to ``False``, so the class
-    identity *is* the declaration; seeing the class but a truthy flag would be
-    a contradiction this module cannot guess around, so it fails closed.
+
+def _is_known_scratch_class(spec: Any) -> bool:
+    """Return whether *spec*'s class is a known per-request scratch spec.
+
+    Args:
+        spec: A vLLM KV cache spec leaf.
+
+    Returns:
+        ``True`` if any class in the MRO is one of
+        :data:`_KNOWN_SCRATCH_SPEC_CLASSES`.
     """
-    if not any(cls.__name__ == "CircularBufferSpec" for cls in type(spec).__mro__):
-        return False
+    return any(
+        cls.__name__ in _KNOWN_SCRATCH_SPEC_CLASSES for cls in type(spec).__mro__
+    )
+
+
+def _declares_non_prefix_cacheable(spec: Any) -> bool:
+    """Return whether a leaf spec declares itself out of prefix caching.
+
+    The decision is read from the engine's own declaration --
+    ``KVCacheSpec.prefix_cacheable`` -- never from the class name or the byte
+    shape.  This predicate used to match the class name ``CircularBufferSpec``
+    (so the module could stay importable without vLLM), which silently missed
+    every *other* per-request scratch spec: vLLM also declares
+    ``KpoolTailSpec`` (one-block circular scratch for a kpool indexer's raw
+    tail), ``HiSparseHotSpec`` and ``HiSparseResidentSpec`` as
+    ``prefix_cacheable=False``.  ``KpoolTailSpec`` extends ``SlidingWindowSpec``,
+    so it is structurally an ordinary sliding-window group and would have been
+    stored as if it were reusable prefix KV -- poisoning the cache across
+    requests.  Keying on the declaration covers all of them and cannot be
+    outrun by the next spec vLLM adds.  It also matches what vLLM itself does
+    to pick its own storeable groups (``KVCacheConfig.
+    prefix_cacheable_group_ids`` filters on exactly this property).
+
+    Args:
+        spec: A vLLM KV cache spec leaf.
+
+    Returns:
+        ``True`` when the spec declares ``prefix_cacheable=False``.  ``False``
+        when it declares ``True`` or does not declare the attribute at all (a
+        legacy vLLM, or a non-``KVCacheSpec`` object): an undeclared spec is
+        kept, because nothing marks it as per-request scratch.
+
+    Raises:
+        ValueError: If the attribute is present but not a ``bool``.  A
+            non-boolean declaration cannot be interpreted, and guessing either
+            way would silently store or drop a group.
+    """
     prefix_cacheable = getattr(spec, "prefix_cacheable", None)
-    uses_slot_mapping = getattr(spec, "uses_slot_mapping", None)
-    if prefix_cacheable is True or uses_slot_mapping is True:
+    if prefix_cacheable is None:
+        return False
+    if not isinstance(prefix_cacheable, bool):
         raise ValueError(
-            "vLLM CircularBufferSpec must declare prefix_cacheable=False and "
-            "uses_slot_mapping=False; got prefix_cacheable="
-            f"{prefix_cacheable!r}, uses_slot_mapping={uses_slot_mapping!r}. "
-            "Refusing to guess whether the compressor ring is cacheable."
+            "vLLM KV cache spec declares a non-boolean prefix_cacheable="
+            f"{prefix_cacheable!r} of type {type(prefix_cacheable).__name__}; "
+            "LMCache cannot tell whether the group is reusable prefix KV and "
+            "will not guess."
         )
-    return True
+    # Contradiction guard. The *decision* is the declaration, so a class
+    # LMCache has never heard of cannot be mis-excluded -- but for a class that
+    # is per-request scratch by definition, a truthy flag is self-contradictory
+    # and storing it would poison the cache. Refuse rather than pick a side.
+    if prefix_cacheable and _is_known_scratch_class(spec):
+        uses_slot_mapping = getattr(spec, "uses_slot_mapping", None)
+        raise ValueError(
+            f"vLLM {type(spec).__name__} is per-request scratch and must "
+            "declare prefix_cacheable=False"
+            f"; got prefix_cacheable={prefix_cacheable!r}, "
+            f"uses_slot_mapping={uses_slot_mapping!r}. Refusing to guess "
+            "whether the group is reusable prefix KV."
+        )
+    return not prefix_cacheable
 
 
-def is_circular_buffer_ring_spec(spec: Any) -> bool:
-    """Return whether a vLLM KV cache spec is the compressor circular-buffer ring.
+def is_non_prefix_cacheable_spec(spec: Any) -> bool:
+    """Return whether a vLLM KV cache spec must be excluded from prefix caching.
 
     The ring is DeepSeek-V4.1's per-request scratch: one block per request
     holds the raw ``[kv, score]`` rows of the token group still being
@@ -106,24 +179,41 @@ def is_circular_buffer_ring_spec(spec: Any) -> bool:
     leaf is the ring is a ring group. A mixed wrapper (ring beside regular
     pools) must not count, or the whole group would be wrongly excluded.
 
+    Concerned specs are the engine's per-request scratch -- content that is a
+    deterministic function of neither the prefix nor the position alone, so it
+    can never be reused as prefix KV.  vLLM declares each of them
+    ``prefix_cacheable=False``: the DeepSeek-V4.1 compressor ring
+    (``CircularBufferSpec``; its slots are addressed as
+    ``block * capacity + pos % capacity`` and a speculative write is rolled
+    back on rejection), a kpool indexer's raw tail (``KpoolTailSpec``) and the
+    HiSparse pools.  Their bytes are shape-indistinguishable from a real pool,
+    which is why detection cannot -- and must not -- classify them from the
+    tensors.
+
+    Handles a ``UniformTypeKVCacheSpecs`` wrapper too: a group whose every
+    leaf is non-cacheable is a scratch group.  A mixed wrapper (scratch beside
+    regular pools) must not count, or the whole group would be wrongly
+    excluded.
+
     Args:
         spec: A vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``),
             or ``None``.
 
     Returns:
-        ``True`` only for a compressor ring spec.
+        ``True`` when the spec (or every leaf of a wrapper) declares itself
+        non-prefix-cacheable.
 
     Raises:
-        ValueError: If a ``CircularBufferSpec`` declares itself cacheable.
+        ValueError: If a leaf declares a non-boolean ``prefix_cacheable``.
     """
     if spec is None:
         return False
     leaves = getattr(spec, "kv_cache_specs", None)
     if isinstance(leaves, dict):
         return bool(leaves) and all(
-            _is_circular_buffer_ring_class(leaf) for leaf in leaves.values()
+            _declares_non_prefix_cacheable(leaf) for leaf in leaves.values()
         )
-    return _is_circular_buffer_ring_class(spec)
+    return _declares_non_prefix_cacheable(spec)
 
 
 def resolve_vllm_kv_layout(

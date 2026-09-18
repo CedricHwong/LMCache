@@ -61,12 +61,13 @@ from lmcache.integration.vllm.kv_cache_groups import (
 )
 from lmcache.v1.gpu_connector.kv_format import get_spec
 from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
-    is_circular_buffer_ring_spec,
+    is_non_prefix_cacheable_spec,
 )
 from lmcache.v1.gpu_connector.utils import (
     is_indexer_k_row,
     resolve_indexer_row_geometry,
 )
+from lmcache.v1.platform.base import cache_context
 from lmcache.v1.kv_layer_groups import (
     EXCLUDED_ENGINE_GROUP,
     KVLayerGroupsManager,
@@ -144,6 +145,18 @@ class CircularBufferSpec(AttentionSpec):
 
     prefix_cacheable: bool = False
     uses_slot_mapping: bool = False
+
+
+@dataclass
+class KpoolTailSpec(SlidingWindowSpec):
+    """vLLM ``KpoolTailSpec``：kpool indexer 原始尾部，一 block 环形 scratch。
+
+    它**继承 ``SlidingWindowSpec``** —— 结构上就是一个普通 SWA 组，所以按形状
+    或按类名白名单都不可能可靠识别；只有 ``prefix_cacheable=False`` 这条声明
+    能把它与真正可复用的滑窗组区分开。
+    """
+
+    prefix_cacheable: bool = False
 
 
 @dataclass
@@ -591,6 +604,31 @@ class TestHitLengthPhysicalStates:
         assert ctx.group_compress_ratios() == [1] * 8 + [2, 2, 1, 1]
         assert ctx.group_lcm_block_size() == 64
 
+    def test_group_lcm_delegates_to_the_shared_helper(self) -> None:
+        """``group_lcm_block_size`` 必须调用共享的权威 lcm helper。
+
+        这是一个**结构性**判别式：两种实现（直接 ``math.lcm`` 与委托）在同
+        输入上产生**同一个数值**，所以断言返回值无法发现回归 —— 而第三条独立
+        的 lcm 实现正是审计要消除的「静默分叉」来源。因此这里 spy 住
+        ``cache_context`` 模块里绑定的 helper 名，断言它确实被调用、且收到的是
+        参与组（span, True）序列。若有人把 ``math.lcm`` 写回去，这个测试变红。
+        """
+        ctx = self._ctx(_prod_lmcache_groups())
+        seen: list[list[tuple[int, bool]]] = []
+
+        def spy(group_spans):
+            pairs = list(group_spans)
+            seen.append(pairs)
+            return 64
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                cache_context, "lcm_cacheable_block_tokens", spy, raising=True
+            )
+            assert ctx.group_lcm_block_size() == 64
+
+        assert seen == [[(32, True)] * 8 + [(64, True)] * 4]
+
     def test_align_hit_length(self) -> None:
         """``align_hit_length`` 对 96/234/256/63 的裁剪（docs/03 §4）。"""
         ctx = self._ctx(_prod_lmcache_groups())
@@ -769,10 +807,50 @@ class TestGroupBlockMask:
 
 class TestCircularBufferRingExclusion:
     def test_ring_predicate(self) -> None:
-        """谓词恰好命名环类：裸环 / 全环 wrapper 为 True，其余为 False。"""
-        assert is_circular_buffer_ring_spec(CircularBufferSpec(block_size=8)) is True
-        assert is_circular_buffer_ring_spec(FullAttentionSpec(block_size=16)) is False
-        assert is_circular_buffer_ring_spec(None) is False
+        """按**声明**判定：环为 True；普通全注意力 / SWA 为 False。"""
+        assert (
+            is_non_prefix_cacheable_spec(CircularBufferSpec(block_size=8)) is True
+        )
+        assert (
+            is_non_prefix_cacheable_spec(FullAttentionSpec(block_size=16)) is False
+        )
+        assert is_non_prefix_cacheable_spec(None) is False
+
+    def test_kpool_tail_spec_is_excluded(self) -> None:
+        """``KpoolTailSpec`` 必须被排除，尽管它看起来就是个滑窗组。
+
+        这是 P1-6 的核心：旧实现按类名匹配 ``CircularBufferSpec``，于是
+        ``KpoolTailSpec``（vLLM 声明 ``prefix_cacheable=False``）会被当成可复用
+        前缀 KV 存下来，跨请求污染缓存。同一形状的真正可复用 SWA 组必须**不**
+        被排除 —— 二者只能靠声明区分。
+        """
+        tail = KpoolTailSpec(block_size=8, sliding_window=128)
+        assert is_non_prefix_cacheable_spec(tail) is True
+        # 同一形状、未声明不可缓存的滑窗组必须保留
+        swa = SlidingWindowSpec(block_size=8, sliding_window=128)
+        assert is_non_prefix_cacheable_spec(swa) is False
+
+    def test_non_bool_declaration_fails_closed(self) -> None:
+        """``prefix_cacheable`` 不是 bool 时无法解读，必须抛。"""
+
+        class Ambiguous(FullAttentionSpec):
+            prefix_cacheable = "yes"  # type: ignore[assignment]
+
+        with pytest.raises(ValueError, match="non-boolean prefix_cacheable"):
+            is_non_prefix_cacheable_spec(Ambiguous(block_size=8))
+
+    def test_unknown_spec_defers_to_declaration(self) -> None:
+        """LMCache 从未见过的 spec 也按声明处理 —— 白名单不会漏掉下一个。"""
+
+        class FutureScratchSpec(SlidingWindowSpec):
+            prefix_cacheable = False
+
+        assert (
+            is_non_prefix_cacheable_spec(
+                FutureScratchSpec(block_size=8, sliding_window=128)
+            )
+            is True
+        )
         all_ring = UniformTypeKVCacheSpecs(
             block_size=8,
             kv_cache_specs={
@@ -780,7 +858,7 @@ class TestCircularBufferRingExclusion:
                 "b": CircularBufferSpec(block_size=8),
             },
         )
-        assert is_circular_buffer_ring_spec(all_ring) is True
+        assert is_non_prefix_cacheable_spec(all_ring) is True
         mixed = UniformTypeKVCacheSpecs(
             block_size=8,
             kv_cache_specs={
@@ -788,13 +866,13 @@ class TestCircularBufferRingExclusion:
                 "b": FullAttentionSpec(block_size=16),
             },
         )
-        assert is_circular_buffer_ring_spec(mixed) is False
+        assert is_non_prefix_cacheable_spec(mixed) is False
 
     def test_ring_contradiction_fails_closed(self) -> None:
         """声明可缓存的环是矛盾，必须抛，不得静默放行。"""
         bad = CircularBufferSpec(block_size=8, prefix_cacheable=True)
         with pytest.raises(ValueError, match="prefix_cacheable=False"):
-            is_circular_buffer_ring_spec(bad)
+            is_non_prefix_cacheable_spec(bad)
 
     def test_ring_mask_all_false(self) -> None:
         """环的掩码显式全 False（round-trip 组数），调用方可整组跳过。"""

@@ -649,21 +649,30 @@ def create_engine_group_infos_from_vllm(
     # tensors out of every LMCache kernel group, so they are never silently
     # stored as if they were request-reusable KV.
     from lmcache.v1.gpu_connector.kv_format.detectors.vllm import (
-        is_circular_buffer_ring_spec,
+        is_non_prefix_cacheable_spec,
     )
 
     ring_group_ids = frozenset(
         gid
         for gid, group in enumerate(vllm_groups)
-        if is_circular_buffer_ring_spec(getattr(group, "kv_cache_spec", None))
+        if is_non_prefix_cacheable_spec(getattr(group, "kv_cache_spec", None))
     )
     if ring_group_ids:
         logger.warning(
-            "Excluding %d compressor circular-buffer ring KV group(s) "
-            "(engine group id(s) %s): per-request compressor scratch, never "
-            "cached.",
+            "Excluding %d non-prefix-cacheable KV group(s) (engine group "
+            "id(s) %s, spec type(s) %s): per-request scratch the engine "
+            "declares unreusable (compressor ring / kpool tail / HiSparse), "
+            "never cached.",
             len(ring_group_ids),
             ", ".join(str(gid) for gid in sorted(ring_group_ids)),
+            ", ".join(
+                sorted(
+                    {
+                        type(vllm_groups[gid].kv_cache_spec).__name__
+                        for gid in ring_group_ids
+                    }
+                )
+            ),
         )
 
     # EAGLE block-drop groups: vLLM's scheduler prunes the trailing block of
@@ -685,7 +694,7 @@ def create_engine_group_infos_from_vllm(
             ", ".join(str(gid) for gid in sorted(eagle_group_ids)),
         )
     # Preserve the original engine group ids (the engine's per-request block-id
-    # lists are keyed by them), so only skip the ring groups.
+    # lists are keyed by them), so only skip the non-cacheable groups.
     cacheable_vllm_groups = [
         (gid, group)
         for gid, group in enumerate(vllm_groups)
