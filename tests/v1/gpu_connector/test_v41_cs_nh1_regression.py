@@ -5,6 +5,13 @@ DeepSeek-V4.1's fused-K/V KV cache registers a BLHNC ``[NB, NH, BS, CS]``
 pool (``EngineKVFormat.NL_X_NB_NH_BS_CS``) with a single KV head
 (``NH == 1``) and content width ``CS == 2 * HS`` (K/V packed).
 
+The page this file was originally written against -- 584 B/token on the SM90
+production stack -- turned out NOT to be such a pool: it is a blocked-scale
+record (576 value + 8 scale) and is now routed to ``NL_X_NB_BSV_BSS``. The CS
+contract below is therefore pinned on a genuinely content-size width
+(``CS_CONTENT``); the 584 B production page has its own test, and its
+misidentification is covered by ``test_blocked_scale_mla_routing.py``.
+
 The C++ transfer branch ``page_buffer_offset`` for that format
 (``csrc/cuda/mem_kernels.cu``) decomposes token/head with
 
@@ -39,15 +46,28 @@ import torch
 from lmcache import device_ops
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector import utils as U
-from lmcache.v1.gpu_connector.kv_format import detect_format
+from lmcache.v1.gpu_connector.kv_format import detect_format, get_spec
 import lmcache.lmcache_native as lmcache_native
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 NB, NL = 6, 3  # few blocks/layers suffice: the corruption is per-token
-# V4.1 production geometry (8xH100/SM90): fused K/V content width 584
-# (576 latent + 8 rope), BLHNC, KV block size 64, single KV head.
+# V4.1 production geometry (8xH100/SM90): a BLHNC ``[NB, NH, BS, CS]`` pool with
+# KV block size 64 and a single KV head.
+#
+# ``PROD_CONTENT == 584`` is the *production* per-token width, but it is NOT a
+# plain fused content width: it is a blocked-scale record -- 576 value bytes + 8
+# scale bytes, segregated per block -- so the detector routes it to
+# ``NL_X_NB_BSV_BSS``, not to ``NL_X_NB_NH_BS_CS``. This file originally read the
+# trailing 8 bytes as "rope" and expected the content-size format; that
+# misidentification is the defect ``tests/v1/gpu_connector/
+# test_blocked_scale_mla_routing.py`` and ``scripts/p0_layout_h100.py`` cover
+# (V1 vs V4: 62.5% of the bytes were lost silently).
+#
+# ``CS_CONTENT`` is a genuinely content-size fused width, so the CS branch's
+# head-size contract below is still pinned on a page that really reaches it.
 PROD_CONTENT, PROD_BLOCK_SIZE = 584, 64
+CS_CONTENT, CS_BLOCK_SIZE = 512, 64
 
 
 def make_pool(
@@ -139,8 +159,12 @@ def test_cs_num_heads_derivation_nh1_vs_nh2():
     ``[NH][BS][CS]`` plane as a bijection, which is why a whole-block round
     trip can hide the bug there.
     """
-    # V4.1 production: NH=1, CS=584 -> SPT=584, hs2=1168 -> num_heads = 0.
+    # The V4.1 production per-token width: NH=1, CS=584 -> SPT=584, hs2=1168 ->
+    # num_heads = 0. (584 is a *blocked-scale* record and no longer reaches this
+    # branch, but the arithmetic it would have hit is what made the bug lethal.)
     assert _buggy_num_heads(1, 584) == 0
+    # The same arithmetic on a genuine content-size width.
+    assert _buggy_num_heads(1, 512) == 0
     # Downscaled equivalent.
     assert _buggy_num_heads(1, 64) == 0
     # NH=2: SPT=32, hs2=32 -> num_heads = 1 (non-zero: per-block bijection).
@@ -153,20 +177,45 @@ def test_cs_num_heads_derivation_nh1_vs_nh2():
     assert 2 * (584 // 2) == 584
 
 
-def test_cs_spec_head_size_is_full_width_on_cpu():
-    """Pin fact: for NL_X_NB_NH_BS_CS, spec.head_size() returns the full
-    content width CS (=> the kernel must NOT halve it, nor double it)."""
+def test_prod_584_page_is_blocked_scale_not_content_size():
+    """584 B/token is a blocked-scale record, not a plain fused content width.
+
+    Regression for the misidentification this file used to encode: it read the
+    trailing 8 bytes of the V4 ``fp8_ds_mla`` record as rope and expected
+    ``NL_X_NB_NH_BS_CS``. They are the *scale* plane. Handing a 584 B page to
+    the content-size format addresses it token-major and loses 62.5% of its
+    bytes on an H100 with no error and no log (``scripts/p0_layout_h100.py``,
+    V1 vs V4).
+    """
     buf, views = make_pool(NB, NL, 1, PROD_BLOCK_SIZE, PROD_CONTENT, "cpu")
     assert buf.shape == (NB, NL, 1, PROD_BLOCK_SIZE, PROD_CONTENT)
     fmt, kv = detect_format(views, EngineType.VLLM, {"kv_layout": "BLHNC"})
-    assert fmt == lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+    assert fmt == lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS
     assert U.get_num_heads(kv, fmt) == 1
     assert U.get_block_size(kv, fmt) == PROD_BLOCK_SIZE
+    # The connector still forwards the FULL 584 B record as ``head_size``: the
+    # blocked-scale branch is handed the whole row and the value/scale split
+    # separately via ``scale_bytes``. Halving it would be just as wrong here.
+    assert U.get_head_size(kv, fmt) == PROD_CONTENT
+    # ... and the split is the real 576 + 8, not the historical 580 + 4.
+    assert get_spec(kv, fmt).blocked_scale_row_geometry() == (576, 8)
+    assert get_spec(kv, fmt).scale_bytes() == 8
+
+
+def test_cs_spec_head_size_is_full_width_on_cpu():
+    """Pin fact: for NL_X_NB_NH_BS_CS, spec.head_size() returns the full
+    content width CS (=> the kernel must NOT halve it, nor double it)."""
+    buf, views = make_pool(NB, NL, 1, CS_BLOCK_SIZE, CS_CONTENT, "cpu")
+    assert buf.shape == (NB, NL, 1, CS_BLOCK_SIZE, CS_CONTENT)
+    fmt, kv = detect_format(views, EngineType.VLLM, {"kv_layout": "BLHNC"})
+    assert fmt == lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
+    assert U.get_num_heads(kv, fmt) == 1
+    assert U.get_block_size(kv, fmt) == CS_BLOCK_SIZE
     # The full K/V-packed content width -- what the connector forwards to the
     # C++ kernel as ``head_size``.
-    assert U.get_head_size(kv, fmt) == PROD_CONTENT
+    assert U.get_head_size(kv, fmt) == CS_CONTENT
     # Blocks-first: the per-block step spans every layer.
-    assert kv[0].stride(0) == buf.stride(0) == NL * 1 * PROD_BLOCK_SIZE * PROD_CONTENT
+    assert kv[0].stride(0) == buf.stride(0) == NL * 1 * CS_BLOCK_SIZE * CS_CONTENT
 
 
 # ======================================================================
@@ -178,7 +227,7 @@ def test_cs_spec_head_size_is_full_width_on_cpu():
 @pytest.mark.parametrize(
     "content,block_size",
     [
-        pytest.param(PROD_CONTENT, PROD_BLOCK_SIZE, id="v41-prod-C584-BS64"),
+        pytest.param(CS_CONTENT, CS_BLOCK_SIZE, id="content-C512-BS64"),
         pytest.param(64, 8, id="scaled-C64-BS8"),
     ],
 )
@@ -229,7 +278,7 @@ def test_nh1_cs_d2h_normal_path_matches_torch(content: int, block_size: int):
 @pytest.mark.parametrize(
     "content,block_size",
     [
-        pytest.param(PROD_CONTENT, PROD_BLOCK_SIZE, id="v41-prod-C584-BS64"),
+        pytest.param(CS_CONTENT, CS_BLOCK_SIZE, id="content-C512-BS64"),
         pytest.param(64, 8, id="scaled-C64-BS8"),
     ],
 )

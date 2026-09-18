@@ -24,6 +24,9 @@ import torch
 
 # First Party
 from lmcache.v1.gpu_connector.kv_format import describe_shape, get_spec
+from lmcache.v1.gpu_connector.kv_format.specs.nl_x_nb_bsv_bss import (
+    BLOCKED_SCALE_RECORDS,
+)
 from lmcache.v1.gpu_connector.utils import (
     is_indexer_k_row,
     resolve_indexer_row_geometry,
@@ -116,20 +119,40 @@ def test_bsv_bss_spec_mxfp4_row():
     assert spec.blocked_scale_row_geometry() == (64, 4)
 
 
-def test_bsv_bss_spec_physical_invariant_vs_identification():
-    """The spec decomposes any %4 row (device page invariant) even when the
-    identity predicate rejects it (only 132/68 are canonical indexer rows)."""
-    kv_caches = [_t(7, 32, 136) for _ in range(1)]
-    spec = get_spec(kv_caches, BSV_BSS)
-    assert spec.blocked_scale_row_geometry() == (132, 4)
+def test_bsv_bss_split_is_record_derived_not_a_fixed_4_bytes():
+    """The value/scale split comes from the record, not from "the last 4 bytes".
+
+    This format's kernels used to hardcode a 4-byte scale, and the spec mirrored
+    that as "any %4 row decomposes into ``(W-4, 4)``". That is wrong for the
+    quantized MLA main KV: vLLM's 584 B ``fp8_ds_mla`` V4 page is 576 value + 8
+    scale, not 580 + 4, and the 528/352 B V4.1 pages are 16/32 B of scale. On an
+    H100, a 584 B page routed through the token-major content-size format lost
+    62.5% of its bytes with no error; splitting it as ``(580, 4)`` here would
+    lose the same bytes a different way. So the split is looked up by record
+    width, and a width with no entry is refused rather than guessed at.
+    """
+    for width, scale in sorted(BLOCKED_SCALE_RECORDS.items()):
+        spec = get_spec([_t(7, 32, width)], BSV_BSS)
+        assert spec.scale_bytes() == scale
+        assert spec.vals_bytes() == width - scale
+        assert spec.blocked_scale_row_geometry() == (width - scale, scale)
+
+
+def test_bsv_bss_unknown_row_width_is_refused_not_guessed():
+    """A width with no record-table entry must not be given a 4-byte split."""
     assert is_indexer_k_row(136, torch.uint8) is False
+    spec = get_spec([_t(7, 32, 136)], BSV_BSS)
+    assert spec.scale_bytes() == 0
+    with pytest.raises(ValueError, match="not a segregated value/scale row"):
+        spec.vals_bytes()
 
 
-@pytest.mark.parametrize("bad_width", [3, 5, 6, 0, 4])
-def test_bsv_bss_spec_rejects_invalid_row_width(bad_width):
-    """Rows not a whole number of 4-byte units raise (not silently truncate)."""
-    spec = get_spec([_t(7, 32, bad_width)], BSV_BSS)
-    with pytest.raises(ValueError, match="row width"):
+@pytest.mark.parametrize("width", [0, 3, 4, 5, 6, 136, 580])
+def test_bsv_bss_spec_rejects_unknown_row_width(width):
+    """An unroutable width raises; it must never be silently truncated."""
+    spec = get_spec([_t(7, 32, width)], BSV_BSS)
+    assert spec.scale_bytes() == 0
+    with pytest.raises(ValueError, match="not a segregated value/scale row"):
         spec.vals_bytes()
 
 

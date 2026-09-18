@@ -45,6 +45,29 @@ struct PageBufferShapeDesc {
   // pack non-block info into dim-0 or do not support dim-0 padding,
   // and ignore this field.
   int block_stride_elems;
+  // Scale-region width in bytes of one *token's* row for blocked-scale
+  // (``NL_X_NB_BSV_BSS``) pages, whose per-block layout is
+  // ``[BS x value_bytes][BS x scale_bytes]`` with the two planes segregated.
+  //
+  // This is the ONE number that varies across quantized DeepSeek MLA caches
+  // and that no tensor shape reveals: the trailing axis of the registration is
+  // the *whole* record (132/68 for the DSA indexer, 584/528/352 for the MLA
+  // main KV), so the split has to be supplied out of band. vLLM itself infers
+  // the layout from bytes-per-token the same way.
+  //
+  // Known records (vLLM ``flashmla_sparse.py`` / ``fused_compress_quant_cache``):
+  //   584 -> 576 + 8   (V4 fp8_ds_mla; H100/SM90)
+  //   528 -> 512 + 16  (V4.1 fp8_ds_mla MXFP8; SM100+)
+  //   352 -> 320 + 32  (nvfp4_ds_mla; SM100+)
+  //   132 -> 128 + 4   (DSA indexer fp8)
+  //    68 ->  64 + 4   (DSA indexer mxfp4)
+  //
+  // 0 means "unset — fall back to the historical 4-byte indexer scale", which
+  // keeps pre-existing indexer callers byte-identical. Default-initialised
+  // because the pybind constructor value-initialises nothing else: a caller
+  // that sets every other field but not this one must still get 0, not an
+  // indeterminate stack value.
+  int scale_bytes = 0;
 
   template <typename ScalarType>
   LMC_TRANSFER_PLAN_HD inline size_t scalars_per_head() const {

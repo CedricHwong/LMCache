@@ -261,7 +261,8 @@ __device__ __forceinline__ int64_t
 page_buffer_offset(const int k_or_v, const int token_idx,
                    const int scalar_offset, const int scalars_per_token,
                    const int page_buffer_size, const int block_size,
-                   const int head_size, const int64_t block_stride_xwords) {
+                   const int head_size, const int64_t block_stride_xwords,
+                   const int scale_units) {
   /*
   logical semantics of arguments (agnostic to physical format):
   k_or_v:            0 for key, 1 for value
@@ -378,18 +379,26 @@ page_buffer_offset(const int k_or_v, const int token_idx,
            static_cast<int64_t>(block_offset) * scalars_per_token +
            scalar_offset;
   }
-  // DSA indexer: page [BSxvals][BSxscales]; 4B units, so scale == 1 unit
+  // Blocked-scale page: [BS x vals][BS x scales], the two planes segregated
+  // within the block. ``scale_units`` is the per-token scale width in working
+  // (scalar_t) units, passed in because the registration shape carries only the
+  // whole record width. Both kernels pin a 4-byte transfer unit for this
+  // format, so in units: 1 for the DSA indexer's 4-byte scale (132/68 B rows),
+  // and 1/2/4 for the quantized MLA main-KV scales (8/16/32 B of scale on the
+  // 584/528/352 B rows).
   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     const int64_t block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
-    const int vals = scalars_per_token - 1;
+    const int vals = scalars_per_token - scale_units;
     const int64_t block_base =
         block_idx * static_cast<int64_t>(block_size) * scalars_per_token;
     if (scalar_offset < vals) {
       return block_base + static_cast<int64_t>(block_offset) * vals +
              scalar_offset;
     }
-    return block_base + static_cast<int64_t>(block_size) * vals + block_offset;
+    return block_base + static_cast<int64_t>(block_size) * vals +
+           static_cast<int64_t>(block_offset) * scale_units +
+           (scalar_offset - vals);
   }
 }
 
@@ -489,7 +498,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
     scalar_t** __restrict__ paged_buffer_ptrs, const int k_or_v_size,
     const int scalars_per_token, const int num_tokens, const int num_layers,
     const int page_buffer_size, const int block_size, const int head_size,
-    const int64_t block_stride_xwords) {
+    const int64_t block_stride_xwords, const int scale_units) {
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int chunk_id = blockIdx.z / k_or_v_size;
@@ -513,7 +522,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
                          num_tokens, num_layers);
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, scale_units);
     if (DIRECTION)
       chunk.key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
     else
@@ -541,7 +550,8 @@ __global__ void load_and_reshape_multi_layer_kernel(
     const int64_t* __restrict__ slot_mapping,   // [num_tokens]
     const int scalars_per_token, const int num_tokens, const int num_layers,
     const int page_buffer_size, const int block_size, const int head_size,
-    const int skip_prefix_n_tokens, const int64_t block_stride_xwords) {
+    const int skip_prefix_n_tokens, const int64_t block_stride_xwords,
+    const int scale_units) {
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int k_or_v = blockIdx.z;
@@ -564,7 +574,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
 
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, scale_units);
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
@@ -676,7 +686,8 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
       <<<grid, block, 0, stream>>>(                                      \
           key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords, \
           num_tokens, num_layers, page_buffer_size, block_size,          \
-          head_size_xword, skip_prefix_n_tokens, block_stride_xwords);   \
+          head_size_xword, skip_prefix_n_tokens, block_stride_xwords,   \
+          scale_units);                                                  \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 template <typename T>
@@ -692,7 +703,7 @@ void multi_layer_kv_transfer_templated(
     const torch::Device& paged_memory_device, const int page_buffer_size,
     const TransferDirection direction, const EngineKVFormat engine_kv_format,
     const int block_size, const int head_size, const int skip_prefix_n_tokens,
-    const int64_t block_stride_elems) {
+    const int64_t block_stride_elems, const int scale_bytes) {
   T* key_value_ptr = get_kernel_ptr<T, torch::Tensor>(key_value);
   T** page_buffer_ptrs =
       get_kernel_ptr<T*, const torch::Tensor>(key_value_ptrs);
@@ -716,10 +727,35 @@ void multi_layer_kv_transfer_templated(
                                             num_xwords);
   // 0 means tight; the per-format offset entries compute their own tight step.
   const int64_t block_stride_xwords = block_stride_elems / elements_per_xword;
+  // The blocked-scale branch splits each row into a value plane and a scale
+  // plane at a fixed byte offset and addresses both in working units, so the
+  // split must land exactly on a unit boundary. The historical check was
+  // ``sizeof(T) == 4``, which silently assumed this format only ever held the
+  // 132/68 B DSA indexer rows: the row-width dispatcher used to pick the widest
+  // unit dividing the whole row, so those two landed on 4 bytes while the
+  // 584/528/352 B MLA main-KV rows landed on 8 and were rejected outright. The
+  // dispatch site now pins a 4-byte unit for this format (matching
+  // ``multi_layer_block_kv_transfer``), and this check asserts the real
+  // invariant rather than a unit width, so it also holds if that ever changes.
+  const int transfer_unit = static_cast<int>(sizeof(T));
+  const int row_bytes = num_xwords * transfer_unit;
+  // Explicit per-token scale width when the caller knows it; otherwise the
+  // historical 4-byte DSA indexer scale, so existing callers stay byte-identical.
+  const int scale_bytes_used =
+      engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS
+          ? (scale_bytes > 0 ? scale_bytes : 4)
+          : 0;
   TORCH_CHECK(
-      engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS || sizeof(T) == 4,
-      "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
-      "must be divisible by 4 and not by 8)");
+      engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS ||
+          (scale_bytes_used % transfer_unit == 0 &&
+           scale_bytes_used >= transfer_unit &&
+           scale_bytes_used < row_bytes),
+      "NL_X_NB_BSV_BSS cannot split a ", row_bytes,
+      " B/token row into value and scale planes on ", transfer_unit,
+      " B transfer units: the scale plane is ", scale_bytes_used,
+      " B. Pass the record's real per-token scale_bytes.");
+  // Per-token scale width of a blocked-scale page, in working units.
+  const int scale_units = scale_bytes_used / transfer_unit;
 
   // Fused packs K+V in the trailing dim (kv_size == 1, like MLA): single pass.
   int k_or_v_size =
@@ -840,7 +876,8 @@ void multi_layer_kv_transfer_fused_templated(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size, const int64_t block_stride_elems) {
+    const int head_size, const int64_t block_stride_elems,
+    const int scale_bytes) {
   const int n_chunks = static_cast<int>(key_values.size());
   TORCH_CHECK(n_chunks >= 1 && n_chunks <= MAX_FUSED_TRANSFER_CHUNKS,
               "fused transfer chunk count out of range: ", n_chunks);
@@ -870,10 +907,35 @@ void multi_layer_kv_transfer_fused_templated(
                                             num_xwords);
   // 0 means tight; the per-format offset entries compute their own tight step.
   const int64_t block_stride_xwords = block_stride_elems / elements_per_xword;
+  // The blocked-scale branch splits each row into a value plane and a scale
+  // plane at a fixed byte offset and addresses both in working units, so the
+  // split must land exactly on a unit boundary. The historical check was
+  // ``sizeof(T) == 4``, which silently assumed this format only ever held the
+  // 132/68 B DSA indexer rows: the row-width dispatcher used to pick the widest
+  // unit dividing the whole row, so those two landed on 4 bytes while the
+  // 584/528/352 B MLA main-KV rows landed on 8 and were rejected outright. The
+  // dispatch site now pins a 4-byte unit for this format (matching
+  // ``multi_layer_block_kv_transfer``), and this check asserts the real
+  // invariant rather than a unit width, so it also holds if that ever changes.
+  const int transfer_unit = static_cast<int>(sizeof(T));
+  const int row_bytes = num_xwords * transfer_unit;
+  // Explicit per-token scale width when the caller knows it; otherwise the
+  // historical 4-byte DSA indexer scale, so existing callers stay byte-identical.
+  const int scale_bytes_used =
+      engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS
+          ? (scale_bytes > 0 ? scale_bytes : 4)
+          : 0;
   TORCH_CHECK(
-      engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS || sizeof(T) == 4,
-      "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
-      "must be divisible by 4 and not by 8)");
+      engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS ||
+          (scale_bytes_used % transfer_unit == 0 &&
+           scale_bytes_used >= transfer_unit &&
+           scale_bytes_used < row_bytes),
+      "NL_X_NB_BSV_BSS cannot split a ", row_bytes,
+      " B/token row into value and scale planes on ", transfer_unit,
+      " B transfer units: the scale plane is ", scale_bytes_used,
+      " B. Pass the record's real per-token scale_bytes.");
+  // Per-token scale width of a blocked-scale page, in working units.
+  const int scale_units = scale_bytes_used / transfer_unit;
 
   int k_or_v_size =
       (::is_mla(engine_kv_format) || ::is_fused_packed(engine_kv_format)) ? 1
@@ -892,7 +954,8 @@ void multi_layer_kv_transfer_fused_templated(
         <<<grid, block, 0, stream>>>(pack, page_buffer_ptrs, k_or_v_size,   \
                                      num_xwords, num_tokens, num_layers,    \
                                      page_buffer_size, block_size,          \
-                                     head_size_xword, block_stride_xwords); \
+                                     head_size_xword, block_stride_xwords,  \
+                                     scale_units);                          \
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 #ifndef FUSED_FORMAT_SWITCH
@@ -961,7 +1024,8 @@ void multi_layer_kv_transfer_fused_ptr(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size, const int64_t block_stride_elems) {
+    const int head_size, const int64_t block_stride_elems,
+    const int scale_bytes) {
   int copy_size = num_origin_elements * element_size;
 #ifndef LAUNCH_FUSED_TRANSFER
   #define LAUNCH_FUSED_TRANSFER(type)                                         \
@@ -970,10 +1034,22 @@ void multi_layer_kv_transfer_fused_ptr(
           key_values, slot_mappings, n_toks, page_buffer_ptrs, num_layers,    \
           layout_num_tokens, num_origin_elements, element_size,               \
           paged_memory_device, page_buffer_size, direction, engine_kv_format, \
-          block_size, head_size, block_stride_elems);                         \
+          block_size, head_size, block_stride_elems, scale_bytes);            \
     } while (0)
 #endif
-  if (copy_size % 8 == 0) {
+  if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
+    // Pin 4-byte units for the blocked-scale page, exactly as the multiprocess
+    // kernel does (``multi_layer_block_kv_transfer``). The page segregates a
+    // 4/8/16/32 B scale plane from the value plane and the caller passes that
+    // width in bytes, so a wider unit would only add an alignment requirement
+    // without moving more real data -- and it keeps the per-token split exactly
+    // representable for every known record (132/68 B indexer, 584/528/352 B MLA).
+    TORCH_CHECK(copy_size % 4 == 0,
+                "NL_X_NB_BSV_BSS row bytes (", copy_size,
+                ") must be divisible by 4 so the scale plane is a whole number "
+                "of transfer units");
+    LAUNCH_FUSED_TRANSFER(int32_t);
+  } else if (copy_size % 8 == 0) {
     LAUNCH_FUSED_TRANSFER(int64_t);
   } else if (copy_size % 4 == 0) {
     LAUNCH_FUSED_TRANSFER(int32_t);
@@ -994,7 +1070,7 @@ void multi_layer_kv_transfer(
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
     const int head_size, const int skip_prefix_n_tokens,
-    const int64_t block_stride_elems) {
+    const int64_t block_stride_elems, const int scale_bytes) {
   int num_origin_elements = key_value.size(3);
   int copy_size = num_origin_elements * key_value.element_size();
 #ifndef LAUNCH_MULTI_LAYER_KV_TRANSFER
@@ -1003,10 +1079,19 @@ void multi_layer_kv_transfer(
       multi_layer_kv_transfer_templated<type>(                          \
           key_value, key_value_ptrs, slot_mapping, paged_memory_device, \
           page_buffer_size, direction, engine_kv_format, block_size,    \
-          head_size, skip_prefix_n_tokens, block_stride_elems);         \
+          head_size, skip_prefix_n_tokens, block_stride_elems,          \
+          scale_bytes);                                                 \
     } while (0)
 #endif
-  if (copy_size % 8 == 0) {
+  if (engine_kv_format == EngineKVFormat::NL_X_NB_BSV_BSS) {
+    // See ``multi_layer_kv_transfer_fused_ptr``: pin 4-byte units for the
+    // blocked-scale page, matching the multiprocess kernel.
+    TORCH_CHECK(copy_size % 4 == 0,
+                "NL_X_NB_BSV_BSS row bytes (", copy_size,
+                ") must be divisible by 4 so the scale plane is a whole number "
+                "of transfer units");
+    LAUNCH_MULTI_LAYER_KV_TRANSFER(int32_t);
+  } else if (copy_size % 8 == 0) {
     LAUNCH_MULTI_LAYER_KV_TRANSFER(int64_t);
   } else if (copy_size % 4 == 0) {
     LAUNCH_MULTI_LAYER_KV_TRANSFER(int32_t);

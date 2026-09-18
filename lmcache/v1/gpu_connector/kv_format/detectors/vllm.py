@@ -42,6 +42,9 @@ from lmcache.v1.gpu_connector.kv_format.types import (
     DiscoverableKVCache,
     LayoutHints,
 )
+from lmcache.v1.gpu_connector.kv_format.specs.nl_x_nb_bsv_bss import (
+    blocked_scale_bytes,
+)
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -212,6 +215,30 @@ class VLLM_Detector(EngineDetector):
             and isinstance(kv_caches[0], torch.Tensor)
             and kv_caches[0].dim() == 4
         ):
+            t0 = kv_caches[0]
+            # A *quantized* DeepSeek MLA page does not lay its tokens out
+            # token-by-token: per block it stores every token's value bytes
+            # first and every token's scale bytes after ([BS x vals][BS x
+            # scales]). Only NL_X_NB_BSV_BSS addresses that segregation, and
+            # only a singleton head axis can be laid out that way (one plane).
+            # The registration exposes just the whole record width, so the
+            # value/scale split is looked up by width; a record that is not a
+            # known blocked-scale one falls through to the content-size formats
+            # unchanged.
+            record = int(t0.shape[-1])
+            scale = blocked_scale_bytes(record)
+            singleton_head = t0.shape[1] == 1 or t0.shape[2] == 1
+            if scale > 0 and singleton_head:
+                logger.info(
+                    "vLLM registered a %d B/token blocked-scale DeepSeek MLA "
+                    "page (%d value + %d scale bytes, segregated per block); "
+                    "selecting NL_X_NB_BSV_BSS -- the content-size formats "
+                    "would address it token-major and silently corrupt it.",
+                    record,
+                    record - scale,
+                    scale,
+                )
+                return lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS, kv_caches
             if is_hnd:
                 return lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS, kv_caches
             return lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS, kv_caches

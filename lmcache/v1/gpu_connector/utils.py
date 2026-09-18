@@ -678,6 +678,17 @@ def make_page_buffer_shape_desc(
 
     resolved_stride = int(block_stride_elems) if block_stride_elems else 0
     desc.block_stride_elems = resolved_stride
+    # Blocked-scale pages store every token's value bytes and then every token's
+    # scale bytes ([BS x vals][BS x scales]); the transfer kernels address those
+    # two planes separately and therefore need the per-token scale width. No
+    # tensor shape carries it -- the trailing axis is the whole record -- so it
+    # comes from the spec's record-width table. Left at 0 for every other format
+    # (and for the historical 4-byte indexer fallback).
+    desc.scale_bytes = (
+        get_spec(kv_caches, engine_kv_format).scale_bytes(layer_idx)
+        if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS
+        else 0
+    )
     return desc
 
 
