@@ -641,6 +641,25 @@ def create_engine_group_infos_from_vllm(
             len(ring_group_ids),
             ", ".join(str(gid) for gid in sorted(ring_group_ids)),
         )
+
+    # EAGLE block-drop groups: vLLM's scheduler prunes the trailing block of
+    # these groups' KV (``KVCacheGroupSpec.is_eagle_group``, annotated only when
+    # ``speculative_config.use_eagle_block_drop()`` holds). The bit is per
+    # engine group -- only the groups holding the draft/speculative layers are
+    # marked, not the whole model -- so it is read per group here and carried
+    # through to the mask grids, which must reserve the same block. Absent on
+    # vLLM builds predating the field, where the default reads as "no drop".
+    eagle_group_ids = frozenset(
+        gid
+        for gid, group in enumerate(vllm_groups)
+        if getattr(group, "is_eagle_group", False)
+    )
+    if eagle_group_ids:
+        logger.info(
+            "EAGLE block-drop enabled for engine group(s) %s: their trailing "
+            "cache block is pruned by the scheduler.",
+            ", ".join(str(gid) for gid in sorted(eagle_group_ids)),
+        )
     # Preserve the original engine group ids (the engine's per-request block-id
     # lists are keyed by them), so only skip the ring groups.
     cacheable_vllm_groups = [
@@ -756,6 +775,7 @@ def create_engine_group_infos_from_vllm(
             # pools, non-hybrid single group, old vLLM) get no kwargs and fall
             # through to the struct's contract defaults.
             **_merge_v41_fields(per_layer_v41_fields, indices),
+            is_eagle_group=identity.engine_group_idx in eagle_group_ids,
         )
         for identity, indices in group_layers_by_identity(
             normalized_kv_caches,

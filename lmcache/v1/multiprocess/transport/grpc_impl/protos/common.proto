@@ -80,4 +80,8 @@ message EngineGroupInfo {
   optional bool prefix_cacheable = 12;
   optional int64 page_size_padded = 13;
   optional int64 num_head_slots = 14;
+  // Whether the engine's scheduler prunes this group's trailing EAGLE block
+  // (vLLM's ``KVCacheGroupSpec.is_eagle_group``). False on both sides, so a
+  // plain bool suffices and an old payload decodes to "no drop".
+  bool is_eagle_group = 15;
 }

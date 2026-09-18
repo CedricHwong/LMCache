@@ -282,6 +282,12 @@ class KernelGroupInfo:
     ``EngineGroupInfo.prefix_cacheable``).  ``False`` marks a per-request
     scratch pool (e.g. the V4.1 compressor ring): it never stores, looks up,
     or contributes to a hit length."""
+    is_eagle_group: bool = False
+    """Whether the engine's scheduler prunes this group's trailing EAGLE block
+    (mirrors ``EngineGroupInfo.is_eagle_group``; per engine group, not
+    model-wide).  When set, the sliding-window tail mask reserves one extra
+    block and shifts its right edge, so the retained block set matches the
+    engine's own reachable set."""
 
     def __repr__(self) -> str:
         if not self.layer_indices:
@@ -528,6 +534,7 @@ class KVLayerGroupsManager:
                 else None
             )
             prefix_cacheable = info.prefix_cacheable if info is not None else True
+            is_eagle_group = info.is_eagle_group if info is not None else False
 
             self._validate_block_chunk_size_config(
                 group_idx,
@@ -559,6 +566,7 @@ class KVLayerGroupsManager:
                         else 1
                     ),
                     prefix_cacheable=prefix_cacheable,
+                    is_eagle_group=is_eagle_group,
                 )
             )
 

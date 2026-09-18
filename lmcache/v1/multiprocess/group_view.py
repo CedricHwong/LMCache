@@ -136,6 +136,19 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     ``AttentionSpec.num_head_slots``); ``None`` = one slot per KV head.
     Defaulted field: wire-compatible."""
 
+    is_eagle_group: bool = False
+    """Whether the engine's scheduler prunes this group's trailing EAGLE block.
+
+    Mirrors vLLM's ``KVCacheGroupSpec.is_eagle_group``, which the engine
+    annotates on the specific groups holding speculative-decoding layers and
+    only when ``speculative_config.use_eagle_block_drop()`` holds. **Per
+    group**, not model-wide: a hybrid model typically marks only the group
+    holding the draft layers.
+
+    The bit changes which blocks the engine considers reachable, so the mask
+    grids must reproduce it or the two sides disagree about which blocks a hit
+    may consume. Defaulted field: wire-compatible."""
+
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:
     """Return the number of engine groups (block-id lists per transfer request).
@@ -428,6 +441,7 @@ class MaskGroup(Protocol):
     tokens_per_state: int
     prefix_cacheable: bool
     recurrent_state: bool
+    is_eagle_group: bool
 
 
 def group_engine_group_id(group: MaskGroup) -> int | None:
@@ -725,13 +739,16 @@ def _mask_for_group(
     segment_tokens: int,
     exclude_non_cacheable: bool,
     exclude_recurrent: bool,
-    use_eagle: bool,
 ) -> GroupBlockMask:
     """Build one group's :class:`GroupBlockMask` over the token range.
 
     Applies the exclusion rules first (Mooncake's ``_verify_and_split`` skip
     for non-cacheable groups and the ``store_mask`` mamba exclude), then the
     sliding-window tail mask, then the full-attention all-True sentinel.
+
+    The EAGLE peek is taken from ``group.is_eagle_group`` rather than a
+    parameter: it is a per-group engine annotation, and threading it as an
+    argument let the production entry points silently default it to ``False``.
 
     Args:
         group: One group descriptor (``EngineGroupInfo`` or ``KernelGroupInfo``).
@@ -743,7 +760,6 @@ def _mask_for_group(
             (always all-False).
         exclude_recurrent: Drop ``recurrent_state`` groups (store-side mamba
             exclude; all-False).
-        use_eagle: Reserve the EAGLE peek block in the window tail mask.
 
     Returns:
         The group's block mask.  Excluded groups yield an explicit all-False
@@ -782,7 +798,7 @@ def _mask_for_group(
             start_block,
             end_block,
             segment_tokens,
-            use_eagle=use_eagle,
+            use_eagle=group.is_eagle_group,
         )
         return GroupBlockMask(
             group_idx,
@@ -811,7 +827,6 @@ def compute_group_store_masks(
     segment_tokens: int,
     exclude_non_cacheable: bool = True,
     exclude_recurrent: bool = False,
-    use_eagle: bool = False,
 ) -> list[GroupBlockMask]:
     """Per-group store masks for the suffix ``[start_token, token_len)``.
 
@@ -835,7 +850,6 @@ def compute_group_store_masks(
             blocks from the engine's live block table each step, so the
             connector artifact Mooncake guards against does not apply — keep
             this False unless a caller wants the store-side exclusion.
-        use_eagle: Reserve the EAGLE peek block in the window tail mask.
 
     Returns:
         One :class:`GroupBlockMask` per LMCache group, in protocol order; each
@@ -869,7 +883,6 @@ def compute_group_store_masks(
                 segment_tokens=segment_tokens,
                 exclude_non_cacheable=exclude_non_cacheable,
                 exclude_recurrent=exclude_recurrent,
-                use_eagle=use_eagle,
             )
         )
     return masks
@@ -924,7 +937,6 @@ def compute_group_lookup_masks(
                 segment_tokens=used_segment,
                 exclude_non_cacheable=exclude_non_cacheable,
                 exclude_recurrent=False,
-                use_eagle=False,
             )
         )
     return masks
@@ -978,7 +990,6 @@ def compute_group_load_masks(
                 segment_tokens=segment_tokens,
                 exclude_non_cacheable=exclude_non_cacheable,
                 exclude_recurrent=False,
-                use_eagle=False,
             )
         )
     return masks

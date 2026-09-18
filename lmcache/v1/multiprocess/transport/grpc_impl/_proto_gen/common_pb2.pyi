@@ -63,7 +63,7 @@ class TokensPerState(_message.Message):
     def __init__(self, numerator: _Optional[int] = ..., denominator: _Optional[int] = ...) -> None: ...
 
 class EngineGroupInfo(_message.Message):
-    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state", "tokens_per_state", "cache_role", "state_content_bytes", "block_stride_alignment", "is_index_group_leader", "prefix_cacheable", "page_size_padded", "num_head_slots")
+    __slots__ = ("engine_group_id", "layer_indices", "tokens_per_block", "sw_size_tokens", "extra_object_group_tag", "recurrent_state", "tokens_per_state", "cache_role", "state_content_bytes", "block_stride_alignment", "is_index_group_leader", "prefix_cacheable", "page_size_padded", "num_head_slots", "is_eagle_group")
     ENGINE_GROUP_ID_FIELD_NUMBER: _ClassVar[int]
     LAYER_INDICES_FIELD_NUMBER: _ClassVar[int]
     TOKENS_PER_BLOCK_FIELD_NUMBER: _ClassVar[int]
@@ -78,6 +78,7 @@ class EngineGroupInfo(_message.Message):
     PREFIX_CACHEABLE_FIELD_NUMBER: _ClassVar[int]
     PAGE_SIZE_PADDED_FIELD_NUMBER: _ClassVar[int]
     NUM_HEAD_SLOTS_FIELD_NUMBER: _ClassVar[int]
+    IS_EAGLE_GROUP_FIELD_NUMBER: _ClassVar[int]
     engine_group_id: int
     layer_indices: _containers.RepeatedScalarFieldContainer[int]
     tokens_per_block: int
@@ -92,4 +93,5 @@ class EngineGroupInfo(_message.Message):
     prefix_cacheable: bool
     page_size_padded: int
     num_head_slots: int
-    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ..., tokens_per_state: _Optional[_Union[TokensPerState, _Mapping]] = ..., cache_role: _Optional[str] = ..., state_content_bytes: _Optional[int] = ..., block_stride_alignment: _Optional[int] = ..., is_index_group_leader: bool = ..., prefix_cacheable: bool = ..., page_size_padded: _Optional[int] = ..., num_head_slots: _Optional[int] = ...) -> None: ...
+    is_eagle_group: bool
+    def __init__(self, engine_group_id: _Optional[int] = ..., layer_indices: _Optional[_Iterable[int]] = ..., tokens_per_block: _Optional[int] = ..., sw_size_tokens: _Optional[int] = ..., extra_object_group_tag: _Optional[int] = ..., recurrent_state: bool = ..., tokens_per_state: _Optional[_Union[TokensPerState, _Mapping]] = ..., cache_role: _Optional[str] = ..., state_content_bytes: _Optional[int] = ..., block_stride_alignment: _Optional[int] = ..., is_index_group_leader: bool = ..., prefix_cacheable: bool = ..., page_size_padded: _Optional[int] = ..., num_head_slots: _Optional[int] = ..., is_eagle_group: bool = ...) -> None: ...

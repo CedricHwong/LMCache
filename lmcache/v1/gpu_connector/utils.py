@@ -706,8 +706,12 @@ def make_page_buffer_shape_desc(
 # evaluable discriminator. The engine-side KV page layout behind it is the
 # segregated ``[BS x vals][BS x scale]`` of ``NL_X_NB_BSV_BSS`` (its
 # ``NL_X_NB_BSV_BSS_Spec`` also decomposes a row as ``(vals, scale)``), which
-# the device kernels already treat generically as ``(vals, scale) = (W - 4, 4)``
-# bytes.
+# the device kernels address with the group's declared ``scale_bytes``
+# (``PageBufferShapeDesc.scale_bytes``): a 4-byte-scale cache such as this one
+# keeps ``(vals, scale) = (W - 4, 4)``, while the main MLA cache's 8- and
+# 32-byte scales resolve to ``(W - 8, 8)`` and ``(W - 32, 32)``. The kernels
+# pin the scalar unit at 4 bytes regardless of row width, so the split is a
+# per-group property rather than a fixed ``W - 4``.
 _INDEXER_ROW_WIDTHS = frozenset((132, 68))
 """DSA indexer K row widths in bytes (fp8 128+4, MXFP4 64+4) for the default
 ``index_head_dim == 128``; extend if a model uses another ``index_head_dim``."""
