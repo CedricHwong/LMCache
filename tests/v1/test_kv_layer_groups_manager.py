@@ -50,6 +50,55 @@ def _build_manager(
     )
 
 
+class TestDeclaredCompressionWithoutBlockSpan:
+    """P1-3: a declared compression ratio must never be silently downgraded.
+
+    ``EngineGroupInfo.tokens_per_block == 0`` means the engine did not report a
+    block span, so the manager falls back to the physical slot count and the
+    derived compression ratio becomes 1.  When the engine *also* declared
+    ``tokens_per_state > 1`` those two statements contradict, and the old code
+    suppressed the cross-check entirely (it gated ``declared_tokens_per_state``
+    on ``tokens_per_block > 0``), quietly serving a compressed group as if it
+    were uncompressed -- wrong masks and hit lengths.  It must fail fast.
+    """
+
+    def test_declared_compression_without_block_span_fails_fast(self) -> None:
+        """cr=2 declared but no block span -> refuse, do not assume cr=1."""
+        with pytest.raises(ValueError, match="tokens_per_state"):
+            _build_manager(
+                [torch.zeros(2, 4, 64, 2, 8)],
+                engine_group_infos=[
+                    EngineGroupInfo(
+                        0, (0,), tokens_per_block=0, tokens_per_state=2
+                    )
+                ],
+            )
+
+    def test_declared_uncompressed_without_block_span_still_builds(self) -> None:
+        """cr=1 with no block span is consistent (nothing was declared)."""
+        manager = _build_manager(
+            [torch.zeros(2, 4, 64, 2, 8)],
+            engine_group_infos=[
+                EngineGroupInfo(
+                    0, (0,), tokens_per_block=0, tokens_per_state=1
+                )
+            ],
+        )
+        assert len(manager.kernel_groups) == 1
+
+    def test_consistent_block_span_and_ratio_still_builds(self) -> None:
+        """A real block span with cr=1 keeps working (regression guard)."""
+        manager = _build_manager(
+            [torch.zeros(2, 4, 64, 2, 8)],
+            engine_group_infos=[
+                EngineGroupInfo(
+                    0, (0,), tokens_per_block=64, tokens_per_state=1
+                )
+            ],
+        )
+        assert len(manager.kernel_groups) == 1
+
+
 class TestKVLayerGroupsManager:
     """Tests for KVLayerGroupsManager construction and lookups."""
 

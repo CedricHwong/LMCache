@@ -78,13 +78,16 @@ def resolve_tokens_per_state(spec: Any) -> int:
     block (``block_size // tokens_per_state``), which LMCache re-derives from
     the registered tensors as ``slots_per_block``.
 
-    A ``Fraction`` -- several states per token, e.g. Whisper block pooling --
-    cannot be represented by LMCache's integer ``tokens_per_block //
-    slots_per_block`` compression model, so it raises instead of silently
-    truncating. Non-positive values carry no per-state width and resolve to
-    the uncompressed default: ``0`` is vLLM's sliding-window marker
-    (``DeepseekV41`` layers with ``compress_ratio=0``), ``-1`` the
-    ``MambaSpec`` sentinel.
+    An integral ``Fraction`` (``Fraction(2, 1)``) is accepted as its integer
+    value. A genuinely fractional one -- several states per token, e.g.
+    Whisper block pooling -- cannot be represented by LMCache's integer
+    ``tokens_per_block // slots_per_block`` compression model, so it raises
+    instead of silently truncating. Any other non-integer type (``float``,
+    ``str``, ``bool``, ...) also raises: coercing it to the uncompressed
+    default would address slots the engine never declared. Non-positive
+    integers carry no per-state width and resolve to the uncompressed default:
+    ``0`` is vLLM's sliding-window marker (``DeepseekV41`` layers with
+    ``compress_ratio=0``), ``-1`` the ``MambaSpec`` sentinel.
 
     Args:
         spec: A vLLM KV cache spec (leaf or ``UniformTypeKVCacheSpecs``
@@ -100,22 +103,43 @@ def resolve_tokens_per_state(spec: Any) -> int:
         declares no compression.
 
     Raises:
-        ValueError: If the declared value is a ``Fraction``.
+        ValueError: If the declared value is a non-integral ``Fraction`` or a
+            non-integer type.
     """
     leaf = _first_leaf_spec(spec)
     tokens_per_state = getattr(leaf, "tokens_per_state", None)
     if tokens_per_state is None:
         tokens_per_state = getattr(leaf, "compress_ratio", None)
     if tokens_per_state is None:
+        # Undeclared (old vLLM, or a spec that simply has no compression
+        # field).  ``1`` is the documented "no slot compression" default, so
+        # this is a real absence, not a silent coercion.
         return 1
     if isinstance(tokens_per_state, Fraction):
+        if tokens_per_state.denominator == 1:
+            # ``Fraction(2, 1)`` is exactly the integer 2; several call sites
+            # normalise through ``Fraction`` before reaching here.
+            tokens_per_state = tokens_per_state.numerator
+        else:
+            raise ValueError(
+                "fractional tokens_per_state "
+                f"{tokens_per_state!r} is not representable by LMCache's "
+                "integer compression model (tokens per block / slots per "
+                "block)"
+            )
+    if isinstance(tokens_per_state, bool) or not isinstance(
+        tokens_per_state, int
+    ):
+        # A non-integer declaration is not evidence of "no compression": it is
+        # a value LMCache cannot honour.  Coercing it to the uncompressed
+        # default would compute addresses for a layout the engine did not
+        # declare, so refuse instead.
         raise ValueError(
-            "fractional tokens_per_state "
-            f"{tokens_per_state!r} is not representable by LMCache's integer "
-            "compression model (tokens per block / slots per block)"
+            f"tokens_per_state {tokens_per_state!r} of type "
+            f"{type(tokens_per_state).__name__} is not an integer; LMCache "
+            "cannot tell how many tokens each stored state covers, and "
+            "assuming no compression would address the wrong slots"
         )
-    if not isinstance(tokens_per_state, int):
-        return 1
     return tokens_per_state if tokens_per_state > 0 else 1
 
 

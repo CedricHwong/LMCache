@@ -64,7 +64,12 @@ message EngineGroupInfo {
   int64 engine_group_id = 1;
   repeated int64 layer_indices = 2;
   int64 tokens_per_block = 3;
-  int64 sw_size_tokens = 4;
+  // ``optional`` gives this field proto3 presence so the structural codec can
+  // tell "the sender did not declare a sliding window" (absent -> the Python
+  // default ``-1`` = full attention) from "the sender declared 0".  Without
+  // presence an absent field decodes as the proto3 default ``0``, which the
+  // consumer reads as a zero-length window rather than full attention.
+  optional int64 sw_size_tokens = 4;
   int64 extra_object_group_tag = 5;
   bool recurrent_state = 6;
 

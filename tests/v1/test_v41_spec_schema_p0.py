@@ -197,6 +197,7 @@ with pytest.MonkeyPatch.context() as _stub_env:
     # First Party
     from lmcache.integration.vllm.kv_cache_group_edits import (
         _declares_slot_compression,
+        _normalize_cache_role,
     )
     from lmcache.integration.vllm.kv_cache_groups import (
         read_v41_spec_fields,
@@ -377,17 +378,35 @@ class TestResolveTokensPerState:
         with pytest.raises(ValueError, match="Fraction|fractional|tokens_per_state"):
             resolve_tokens_per_state(spec)
 
-    def test_malformed_type_ignored(self) -> None:
-        """非 ``int``/``Fraction`` 的声明（如 ``"2"``）视为未声明 → 1。
+    @pytest.mark.parametrize("bad", ["2", 2.0, b"2", True, ["2"], {"v": 2}])
+    def test_malformed_type_rejected(self, bad: object) -> None:
+        """非 ``int``/``Fraction`` 的**已声明**值必须抛，不得静默当作未声明。
 
-        与 p0-groups 实际实现一致（``kv_cache_groups.py`` 打补丁后
-        ``resolve_tokens_per_state``：非 int 直接返回 1）；fail-closed 只在
-        ``Fraction`` 上触发（任务契约只强制 Fraction 报错）。
+        本用例此前叫 ``test_malformed_type_ignored``，断言 ``"2"`` → ``1``，
+        并在 docstring 里写明「与 p0-groups 实际实现一致」。那是把缺陷写成了
+        期望值：``1`` 意味着「无槽压缩」，于是 LMCache 会按未压缩布局去算一个
+        引擎明确声明了压缩的记录的地址 —— 正是静默致损。契约要求的是
+        **无法表达就拒绝**，而不是挑一个能跑通的默认值。
+
+        注意 ``True``：``bool`` 是 ``int`` 的子类，不显式排除就会被当成 ``1``。
         """
         spec = NightlyMLASpec(  # type: ignore[arg-type]
-            block_size=64, tokens_per_state="2"
+            block_size=64, tokens_per_state=bad
         )
-        assert resolve_tokens_per_state(spec) == 1
+        with pytest.raises(ValueError, match="tokens_per_state|not an integer"):
+            resolve_tokens_per_state(spec)
+
+    @pytest.mark.parametrize(
+        "exact", [Fraction(2, 1), Fraction(4, 2), Fraction(1, 1)]
+    )
+    def test_integral_fraction_accepted(self, exact: Fraction) -> None:
+        """``Fraction`` 的分母为 1 时是精确整数，必须放行而非一律报错。
+
+        多个调用点会先把整数规范化成 ``Fraction`` 再传进来；把这些也拒掉会
+        让合法配置无法构建。
+        """
+        spec = NightlyMLASpec(block_size=64, tokens_per_state=exact)
+        assert resolve_tokens_per_state(spec) == exact.numerator
 
     def test_mamba_minus_one_sentinel_ignored(self) -> None:
         """MambaSpec 的 ``tokens_per_state=-1`` 哨兵（``:1002``）不代表压缩，
@@ -425,6 +444,31 @@ class TestResolveTokensPerState:
 # ============================================================================
 # read_v41_spec_fields
 # ============================================================================
+
+
+class TestNormalizeCacheRole:
+    """``_normalize_cache_role``：缺失 → ``""``；已声明但不可映射 → 拒绝。"""
+
+    def test_absent_role_falls_back_to_empty(self) -> None:
+        """``None``（旧 vLLM / 非 attention spec）是**未声明** → ``""``。"""
+        assert _normalize_cache_role(None) == ""
+
+    def test_enum_and_str_roles_pass_through(self) -> None:
+        """枚举取 ``.value``，字符串原样保留。"""
+        assert _normalize_cache_role(DummySparseRole.INDEXER) == "indexer"
+        assert _normalize_cache_role("indexer") == "indexer"
+        assert _normalize_cache_role("sparse") == "sparse"
+
+    @pytest.mark.parametrize("bad", [{}, 2, ["indexer"], object(), b"indexer"])
+    def test_unmappable_role_rejected(self, bad: object) -> None:
+        """非字符串的**已声明** role 必须抛，不得归一成 ``""``。
+
+        ``""`` 此前会落进「已知 role」的允许集合里，于是未知或未来新增的
+        role（含 dict 形状的 spec 变体）被静默放行，而不是被拒绝。缓存角色
+        决定该组是否参与稀疏/索引路径，猜错会把地址算到别的布局上。
+        """
+        with pytest.raises(ValueError, match="cache_role|string-like"):
+            _normalize_cache_role(bad)
 
 
 class TestReadV41SpecFields:

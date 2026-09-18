@@ -133,12 +133,24 @@ def _normalize_cache_role(role: object) -> str:
 
     Returns:
         The enum's ``value`` for enums, the string itself for strings, and
-        ``""`` when the role is missing or not string-like.
+        ``""`` when the role is missing.
+
+    Raises:
+        ValueError: If the role is present but not string-like.  Coercing an
+            unrecognised role to ``""`` used to land it inside the allow-list
+            of known roles, so an unknown or future dict/enum value silently
+            passed as a legitimate role instead of being rejected.
     """
     if role is None:
         return ""
     value = getattr(role, "value", role)
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str):
+        return value
+    raise ValueError(
+        f"cache_role {role!r} of type {type(role).__name__} is not "
+        "string-like; LMCache cannot map it to a known role and will not "
+        "guess"
+    )
 
 
 def _declares_slot_compression(spec: KVCacheSpec) -> bool:

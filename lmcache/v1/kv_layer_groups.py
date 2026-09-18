@@ -525,13 +525,18 @@ class KVLayerGroupsManager:
                 else bs
             )
             sw_size_tokens = info.sw_size_tokens if info is not None else -1
-            # tokens_per_state is only meaningful when the engine also reported
-            # a real block span; otherwise the cross-check against the tensor
-            # geometry is skipped and the group falls back to uncompressed.
+            # Pass the declared tokens_per_state through whenever the engine
+            # reported the field, *independently* of whether it also reported a
+            # block span.  Gating this on ``tokens_per_block > 0`` was a silent
+            # downgrade: with no block span ``tokens_per_block`` falls back to
+            # the physical slot count below, so the derived ratio becomes 1 and
+            # an engine that declared ``tokens_per_state > 1`` was quietly
+            # treated as uncompressed -- wrong masks and hit lengths.  The
+            # validator below now sees the contradiction and fail-fasts; a
+            # defaulted ``tokens_per_state == 1`` still passes, so old engines
+            # that never reported the field are unaffected.
             declared_tokens_per_state = (
-                info.tokens_per_state
-                if info is not None and info.tokens_per_block > 0
-                else None
+                info.tokens_per_state if info is not None else None
             )
             prefix_cacheable = info.prefix_cacheable if info is not None else True
             is_eagle_group = info.is_eagle_group if info is not None else False

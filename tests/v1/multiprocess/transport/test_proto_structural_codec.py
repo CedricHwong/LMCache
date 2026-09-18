@@ -130,6 +130,44 @@ def test_legacy_payload_without_v41_tail_decodes_to_python_defaults() -> None:
     assert decoded.state_content_bytes is None
 
 
+def test_absent_sw_size_tokens_decodes_to_full_attention() -> None:
+    """An unset ``sw_size_tokens`` must decode to ``-1``, not proto3's ``0``.
+
+    The Python contract default is ``-1`` = full attention, and the consumer
+    (:meth:`KVLayerGroupsManager.get_subchunk_sw_size_tokens`) returns the whole
+    chunk for ``-1``.  Reading proto3's ``0`` instead would hand it a
+    *zero-length* window and silently mask away every token.  ``optional`` in
+    ``common.proto`` is what makes the two distinguishable on the wire, so this
+    test fails if the annotation is dropped.
+    """
+    legacy = common_pb2.EngineGroupInfo()
+    legacy.engine_group_id = 0
+    legacy.layer_indices.extend([4, 5])
+    legacy.tokens_per_block = 32
+    # sw_size_tokens deliberately never assigned -> absent from the wire.
+    assert not legacy.HasField("sw_size_tokens")
+
+    parsed = common_pb2.EngineGroupInfo()
+    parsed.ParseFromString(legacy.SerializeToString())
+    _, reader = _compile_codec()
+    decoded = reader(parsed)
+
+    assert decoded.sw_size_tokens == -1
+    assert decoded == EngineGroupInfo(0, (4, 5), tokens_per_block=32)
+
+
+def test_explicit_zero_sw_size_tokens_is_distinct_from_absent() -> None:
+    """An explicit ``0`` must survive as ``0``, not collapse into ``-1``.
+
+    This is the other half of presence: a sender that genuinely declared a
+    zero window keeps it, so the fix cannot be "always return the Python
+    default when the value looks falsy".
+    """
+    group = EngineGroupInfo(0, (4, 5), tokens_per_block=32, sw_size_tokens=0)
+    decoded = _round_trip(group)
+    assert decoded.sw_size_tokens == 0
+
+
 def test_non_rational_tokens_per_state_fails_closed() -> None:
     """A float must not be silently truncated into the integer wire field."""
     writer, _ = _compile_codec()
