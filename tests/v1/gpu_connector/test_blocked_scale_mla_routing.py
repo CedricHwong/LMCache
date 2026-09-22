@@ -10,7 +10,7 @@ bytes::
 Only ``NL_X_NB_BSV_BSS`` addresses that segregation (the transfer kernels copy
 the two planes separately). Before this routing existed, a nightly vLLM
 registration of such a page -- rank-4 ``[NB, 1, BS, W]`` with ``W`` in
-{584, 528, 352} -- was judged "fused K/V, HND" and handed to
+{584, 528, 352, 288} -- was judged "fused K/V, HND" and handed to
 ``NL_X_NB_NH_BS_CS``, whose addressing is token-major. That is silently wrong:
 the kernel accepts the launch, the guard passes, and roughly the value plane of
 every token after the first is read from the wrong offset. It is invisible to a
@@ -43,12 +43,15 @@ import lmcache.lmcache_native as lmcache_native
 #   * models/deepseek_v4/common/ops/fused_compress_quant_cache.py -- the V4
 #     page is ``[bs*576)`` data plus ``[bs*576, +bs*8)`` UE8M0 scales.
 #   * v1/attention/backends/mla/flashmla_sparse.py -- V4.1 is 512 e4m3 + 16
-#     ue8m0 (MXFP8), nvfp4 is 320 value + 32 scale.
+#     ue8m0 (MXFP8); the V3.2 nvfp4 record is 320 value + 32 scale.
+#   * models/deepseek_v41/common/ops/fused_compress_quant_cache.py -- the V4.1
+#     compressed ``nvfp4_ds_mla`` record is 256 e2m1 value + 32 e4m3 scale.
 #   * the DSA indexer rows are 128 + 4 (fp8) and 64 + 4 (mxfp4).
 _EXPECTED_SPLIT: dict[int, tuple[int, int]] = {
     584: (576, 8),
     528: (512, 16),
     352: (320, 32),
+    288: (256, 32),
     132: (128, 4),
     68: (64, 4),
 }

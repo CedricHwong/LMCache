@@ -385,7 +385,7 @@ page_buffer_offset(const int k_or_v, const int token_idx,
   // whole record width. Both kernels pin a 4-byte transfer unit for this
   // format, so in units: 1 for the DSA indexer's 4-byte scale (132/68 B rows),
   // and 1/2/4 for the quantized MLA main-KV scales (8/16/32 B of scale on the
-  // 584/528/352 B rows).
+  // 584/528/352/288 B rows).
   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
     const int64_t block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
@@ -733,7 +733,7 @@ void multi_layer_kv_transfer_templated(
   // ``sizeof(T) == 4``, which silently assumed this format only ever held the
   // 132/68 B DSA indexer rows: the row-width dispatcher used to pick the widest
   // unit dividing the whole row, so those two landed on 4 bytes while the
-  // 584/528/352 B MLA main-KV rows landed on 8 and were rejected outright. The
+  // 584/528/352/288 B MLA main-KV rows landed on 8 and were rejected outright. The
   // dispatch site now pins a 4-byte unit for this format (matching
   // ``multi_layer_block_kv_transfer``), and this check asserts the real
   // invariant rather than a unit width, so it also holds if that ever changes.
@@ -913,7 +913,7 @@ void multi_layer_kv_transfer_fused_templated(
   // ``sizeof(T) == 4``, which silently assumed this format only ever held the
   // 132/68 B DSA indexer rows: the row-width dispatcher used to pick the widest
   // unit dividing the whole row, so those two landed on 4 bytes while the
-  // 584/528/352 B MLA main-KV rows landed on 8 and were rejected outright. The
+  // 584/528/352/288 B MLA main-KV rows landed on 8 and were rejected outright. The
   // dispatch site now pins a 4-byte unit for this format (matching
   // ``multi_layer_block_kv_transfer``), and this check asserts the real
   // invariant rather than a unit width, so it also holds if that ever changes.
@@ -1043,7 +1043,7 @@ void multi_layer_kv_transfer_fused_ptr(
     // 4/8/16/32 B scale plane from the value plane and the caller passes that
     // width in bytes, so a wider unit would only add an alignment requirement
     // without moving more real data -- and it keeps the per-token split exactly
-    // representable for every known record (132/68 B indexer, 584/528/352 B MLA).
+    // representable for every known record (132/68 B indexer, 584/528/352/288 B MLA).
     TORCH_CHECK(copy_size % 4 == 0,
                 "NL_X_NB_BSV_BSS row bytes (", copy_size,
                 ") must be divisible by 4 so the scale plane is a whole number "

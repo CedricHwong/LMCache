@@ -243,7 +243,7 @@ __device__ void multi_layer_block_transfer_single_block(
     //
     // The scale width is NOT fixed: it is 4 B for the DSA indexer rows
     // (132/68) but 8/16/32 B for the quantized MLA main-KV rows
-    // (584/528/352), and no registration shape reveals the split. It is
+    // (584/528/352/288), and no registration shape reveals the split. It is
     // therefore carried in ``shape_desc.scale_bytes``; 0 preserves the
     // historical 4-byte indexer behaviour byte-for-byte.
     const size_t spt = shape_desc.scalars_per_token<ScalarType>();

@@ -51,16 +51,21 @@ import lmcache.lmcache_native as lmcache_native
 #     -> ``[0, bs*576)`` fp8/bf16 data + ``[bs*576, +bs*8)`` UE8M0 scales (V4).
 #   * ``v1/attention/backends/mla/flashmla_sparse.py``
 #     -> 528 B = 512 ``float8_e4m3`` + 16 ``ue8m0`` (V4.1 MXFP8, SM100+);
-#        352 B = 256 ``e2m1`` + 64 ``float8_e4m3`` (RoPE) + 32 scale (nvfp4).
+#        352 B = 256 ``e2m1`` + 64 ``float8_e4m3`` (RoPE) + 32 scale (V3.2 nvfp4).
+#   * ``models/deepseek_v41/common/ops/fused_compress_quant_cache.py``
+#     -> 288 B = 256 ``e2m1`` + 32 ``e4m3`` scales of 16 dims each (V4.1
+#        compressed cache, ``nvfp4_ds_mla``, SM100+). Distinct from the 352 B
+#        V3.2 record: no RoPE section, natural (un-permuted) scale order.
 #   * DSA indexer rows (this file's original subject): 132 = 128 + 4,
 #     68 = 64 + 4.
 #
 # Every value is a multiple of 4 so the kernels' 4-byte transfer units stay
 # whole; the split is exact, not a heuristic.
 BLOCKED_SCALE_RECORDS: dict[int, int] = {
-    584: 8,  # DeepSeek V4 MLA main KV, fp8_ds_mla      (SM90/H100)
-    528: 16,  # DeepSeek V4.1 MLA main KV, fp8_ds_mla   (SM100+, MXFP8)
-    352: 32,  # DeepSeek V3.2/V4.1 MLA main KV, nvfp4   (SM100+)
+    584: 8,  # DeepSeek V4 MLA main KV, fp8_ds_mla         (SM90/H100)
+    528: 16,  # DeepSeek V4.1 MLA main KV, fp8_ds_mla       (SM100+, MXFP8)
+    352: 32,  # DeepSeek V3.2 MLA main KV, nvfp4            (SM100+)
+    288: 32,  # DeepSeek V4.1 compressed KV, nvfp4_ds_mla   (SM100+)
     132: 4,  # DSA indexer K, fp8
     68: 4,  # DSA indexer K, mxfp4
 }
@@ -207,8 +212,8 @@ class NL_X_NB_BSV_BSS_Spec(NL_X_NB_BS_HS_Spec):
 
         Derived from the record width via :data:`BLOCKED_SCALE_RECORDS`:
         ``8`` for the 584 B V4 MLA record, ``16`` for V4.1's 528 B MXFP8 one,
-        ``32`` for nvfp4's 352 B one, and the historical ``4`` for the DSA
-        indexer records (``132``/``68``).
+        ``32`` for the 352 B V3.2 and 288 B V4.1 nvfp4 records, and the
+        historical ``4`` for the DSA indexer records (``132``/``68``).
 
         Returns:
             Scale bytes per token; ``0`` when the width is not a known

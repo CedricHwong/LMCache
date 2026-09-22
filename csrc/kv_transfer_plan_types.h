@@ -51,14 +51,15 @@ struct PageBufferShapeDesc {
   //
   // This is the ONE number that varies across quantized DeepSeek MLA caches
   // and that no tensor shape reveals: the trailing axis of the registration is
-  // the *whole* record (132/68 for the DSA indexer, 584/528/352 for the MLA
-  // main KV), so the split has to be supplied out of band. vLLM itself infers
-  // the layout from bytes-per-token the same way.
+  // the *whole* record (132/68 for the DSA indexer, 584/528/352/288 for the
+  // MLA main KV), so the split has to be supplied out of band. vLLM itself
+  // infers the layout from bytes-per-token the same way.
   //
   // Known records (vLLM ``flashmla_sparse.py`` / ``fused_compress_quant_cache``):
   //   584 -> 576 + 8   (V4 fp8_ds_mla; H100/SM90)
   //   528 -> 512 + 16  (V4.1 fp8_ds_mla MXFP8; SM100+)
-  //   352 -> 320 + 32  (nvfp4_ds_mla; SM100+)
+  //   352 -> 320 + 32  (V3.2 nvfp4_ds_mla; SM100+)
+  //   288 -> 256 + 32  (V4.1 nvfp4_ds_mla compressed cache; SM100+)
   //   132 -> 128 + 4   (DSA indexer fp8)
   //    68 ->  64 + 4   (DSA indexer mxfp4)
   //

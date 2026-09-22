@@ -125,7 +125,8 @@ def test_bsv_bss_split_is_record_derived_not_a_fixed_4_bytes():
     This format's kernels used to hardcode a 4-byte scale, and the spec mirrored
     that as "any %4 row decomposes into ``(W-4, 4)``". That is wrong for the
     quantized MLA main KV: vLLM's 584 B ``fp8_ds_mla`` V4 page is 576 value + 8
-    scale, not 580 + 4, and the 528/352 B V4.1 pages are 16/32 B of scale. On an
+    scale, not 580 + 4; the 528 B MXFP8 page carries 16 B and the 352/288 B
+    nvfp4 pages 32 B of scale. On an
     H100, a 584 B page routed through the token-major content-size format lost
     62.5% of its bytes with no error; splitting it as ``(580, 4)`` here would
     lose the same bytes a different way. So the split is looked up by record
