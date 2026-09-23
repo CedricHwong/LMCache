@@ -1292,6 +1292,7 @@ class LMCacheMPWorkerAdapter:
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         self._dropped_retrieves: set[str] = set()
+        self._aborted_retrieves: set[str] = set()
 
         # The store requests that have finished execution in LMCache
         self.finished_stores: set[str] = set()
@@ -1847,6 +1848,10 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def mark_aborted_retrieves(self, request_ids: set[str]) -> None:
+        """Keep abort markers until the engine-finished notification arrives."""
+        self._aborted_retrieves.update(request_ids)
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -1901,7 +1906,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.update(dropped)
 
             ret_stores = self._process_finished_stores(
-                finished_stores, finished_req_ids_from_engine
+                finished_stores, finished_req_ids_from_engine - self._aborted_retrieves
             )
             # A request may have a pending retrieve AND appear in
             # finished_req_ids_from_engine (it ran without loading KV after
@@ -1909,6 +1914,9 @@ class LMCacheMPWorkerAdapter:
             # first and deletes the request, so we must not also report it
             # in finished_sending.
             ret_stores -= finished_retrieves
+            handled_aborts = finished_req_ids_from_engine & self._aborted_retrieves
+            self._returned_finished.update(handled_aborts)
+            self._aborted_retrieves.difference_update(handled_aborts)
             return ret_stores, finished_retrieves
 
         finished_stores = set()
@@ -1962,9 +1970,14 @@ class LMCacheMPWorkerAdapter:
         finished_retrieves.update(dropped)
 
         # Update the internal states
+        retrieving_req_ids = set(self.retrieve_futures) | finished_retrieves
         ret_stores = self._process_finished_stores(
-            finished_stores, finished_req_ids_from_engine
+            finished_stores,
+            finished_req_ids_from_engine - retrieving_req_ids - self._aborted_retrieves,
         )
+        handled_aborts = finished_req_ids_from_engine & self._aborted_retrieves
+        self._returned_finished.update(handled_aborts)
+        self._aborted_retrieves.difference_update(handled_aborts)
 
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
