@@ -614,6 +614,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            self._aborted_retrieve_req_ids: set[str] = set()
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
@@ -782,6 +783,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+
+        self.worker_adapter.mark_aborted_retrieves(metadata.aborted_retrieve_req_ids)
 
         request_ids = []
         ops = []
@@ -1253,6 +1256,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
+        metadata.aborted_retrieve_req_ids = self._aborted_retrieve_req_ids
+        self._aborted_retrieve_req_ids = set()
 
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
@@ -1281,6 +1286,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        for request_id in connector_output.finished_recving or ():
+            tracker = self.request_trackers.get(request_id)
+            if tracker is not None and tracker.state == LMCacheMPRequestState.LOADING:
+                tracker.state = LMCacheMPRequestState.READY
+
         if not self.lazy_offload:
             return
         meta = connector_output.kv_connector_worker_meta
@@ -1312,6 +1322,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+
+        tracker = self.request_trackers.get(request.request_id)
+        load_in_flight = (
+            tracker is not None and tracker.state == LMCacheMPRequestState.LOADING
+        )
+        if load_in_flight and not self.lazy_offload:
+            self._aborted_retrieve_req_ids.add(request.request_id)
 
         params: dict[str, Any] | None = getattr(request, "kv_transfer_params", None)
         return_params: dict[str, Any] | None = {} if params is not None else None
@@ -1349,7 +1366,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
-        return True, (return_params or None)
+        return not load_in_flight, (return_params or None)
 
     def request_finished_all_groups(
         self,
@@ -1454,7 +1471,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
-            request_tracker.state = LMCacheMPRequestState.READY
+                request_tracker.state = LMCacheMPRequestState.LOADING
+            else:
+                request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
         self,
@@ -1469,6 +1488,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            if request_tracker.state == LMCacheMPRequestState.LOADING:
+                continue
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
@@ -1503,6 +1524,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            if request_tracker.state == LMCacheMPRequestState.LOADING:
+                continue
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
