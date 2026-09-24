@@ -105,6 +105,9 @@ if TYPE_CHECKING:
         PromMetric,
         PromMetricT,
     )
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -938,6 +941,35 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> "KVConnectorTransferResults":
+        """Return transfer completions with unambiguous multi-group failures.
+
+        vLLM's block-level failure field is a flat set of integers. Block IDs
+        are only unique inside one KV cache group, so use failed request IDs
+        whenever the active layout has multiple groups (or its group count is
+        unavailable). This lets vLLM recompute the request without guessing
+        which group's block failed.
+
+        Args:
+            finished_req_ids: Request IDs that finished on this worker step.
+
+        Returns:
+            Finished sends, receives, and failed receives for this step.
+        """
+        results = super().get_transfer_results(finished_req_ids)
+        if self.role != KVConnectorRole.WORKER:
+            return results
+
+        failed_request_ids = self.worker_adapter.get_failed_recving_request_ids()
+        if self._has_multiple_kv_cache_groups():
+            # vLLM expects every failed receive to also complete the receive
+            # handshake so it can release WAITING_FOR_REMOTE_KVS requests.
+            results.finished_recving.update(failed_request_ids)
+            results.failed_recving.update(failed_request_ids)
+        return results
+
     def build_connector_worker_meta(self):
         if not self.lazy_offload:
             return None
@@ -969,7 +1001,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
         """
-        return self.worker_adapter.get_block_ids_with_load_errors()
+        error_block_ids = self.worker_adapter.get_block_ids_with_load_errors()
+        if self._has_multiple_kv_cache_groups():
+            if error_block_ids:
+                logger.warning(
+                    "Suppressing %d ambiguous block-level LMCache load errors; "
+                    "the failed receives are reported by request ID",
+                    len(error_block_ids),
+                )
+            return set()
+        return error_block_ids
+
+    def _has_multiple_kv_cache_groups(self) -> bool:
+        """Return whether block IDs cannot safely identify a cache group."""
+        kv_cache_config = getattr(self, "_kv_cache_config", None)
+        groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        # Unknown group topology must fail closed: request-level errors are
+        # safe for both single- and multi-group layouts.
+        return groups is None or len(groups) > 1
 
     def shutdown(self) -> None:
         """

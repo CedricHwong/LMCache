@@ -645,6 +645,8 @@ def test_failed_retrieve_marks_blocks_for_recompute(
 
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == {7, 8}
+    assert adapter.get_failed_recving_request_ids() == {"req-1"}
+    assert adapter.get_failed_recving_request_ids() == set()
     assert "req-1" not in adapter.retrieve_futures
 
 
@@ -818,6 +820,7 @@ def test_dropped_retrieve_reported_once_via_unhealthy_get_finished(
     assert ret_stores == set()
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == {3, 4}
+    assert adapter.get_failed_recving_request_ids() == {"req-1"}
 
     # Exactly once: a second poll must not re-report the request.
     _ret_stores, finished_retrieves = adapter.get_finished(set())
@@ -845,9 +848,53 @@ def test_dropped_retrieve_reported_once_via_healthy_get_finished(
     _ret_stores, finished_retrieves = adapter.get_finished(set())
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == {5}
+    assert adapter.get_failed_recving_request_ids() == {"req-1"}
 
     _ret_stores, finished_retrieves = adapter.get_finished(set())
     assert finished_retrieves == set()
+
+
+@pytest.mark.parametrize(
+    ("groups", "expected_failed_recving", "expected_invalid_blocks"),
+    [
+        ([object(), object()], {"req-1"}, set()),
+        ([object()], set(), {7, 8}),
+        (None, {"req-1"}, set()),
+    ],
+)
+def test_multigroup_retrieve_failures_use_request_identity(
+    groups: list[object] | None,
+    expected_failed_recving: set[str],
+    expected_invalid_blocks: set[int],
+) -> None:
+    """Only single-group layouts may expose ambiguous block-level errors."""
+    pytest.importorskip("vllm")
+
+    # Standard
+    from types import SimpleNamespace
+
+    # Third Party
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.role = KVConnectorRole.WORKER
+    connector.lazy_offload = False
+    connector._kv_cache_config = SimpleNamespace(
+        kv_cache_groups=groups
+    )
+    connector.worker_adapter = MagicMock(name="worker_adapter")
+    connector.worker_adapter.get_finished.return_value = (set(), {"req-1"})
+    connector.worker_adapter.get_failed_recving_request_ids.return_value = {"req-1"}
+    connector.worker_adapter.get_block_ids_with_load_errors.return_value = {7, 8}
+
+    results = connector.get_transfer_results(set())
+
+    assert results.finished_recving == {"req-1"}
+    assert results.failed_recving == expected_failed_recving
+    assert connector.get_block_ids_with_load_errors() == expected_invalid_blocks
 
 
 def test_shutdown_stops_heartbeat_before_unregister(fake_adapter) -> None:

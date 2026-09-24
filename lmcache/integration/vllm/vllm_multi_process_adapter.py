@@ -1288,6 +1288,11 @@ class LMCacheMPWorkerAdapter:
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
 
+        # Request-level failures are needed by vLLM layouts where block IDs
+        # overlap between KV cache groups. Drained with
+        # get_failed_recving_request_ids() after get_finished().
+        self._failed_recving_request_ids: set[str] = set()
+
         # Retrieve request ids dropped by the unhealthy early-return of
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1701,6 +1706,7 @@ class LMCacheMPWorkerAdapter:
         if not self.is_healthy:
             self.error_block_ids.update(op.flat_block_ids)
             self._dropped_retrieves.add(request_id)
+            self._failed_recving_request_ids.add(request_id)
             return
 
         assert op.token_ids is not None
@@ -1885,6 +1891,7 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
+                self._failed_recving_request_ids.add(request_id)
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
@@ -1899,6 +1906,7 @@ class LMCacheMPWorkerAdapter:
             dropped = self._dropped_retrieves
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
+            self._failed_recving_request_ids.update(dropped)
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
@@ -1935,6 +1943,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
+                self._failed_recving_request_ids.add(request_id)
                 self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
@@ -1960,6 +1969,7 @@ class LMCacheMPWorkerAdapter:
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        self._failed_recving_request_ids.update(dropped)
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
@@ -2013,6 +2023,7 @@ class LMCacheMPWorkerAdapter:
                 r_block_ids,
             ) in self.retrieve_futures.items():
                 finished_retrieves.add(request_id)
+                self._failed_recving_request_ids.add(request_id)
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
@@ -2027,6 +2038,7 @@ class LMCacheMPWorkerAdapter:
             dropped = self._dropped_retrieves
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
+            self._failed_recving_request_ids.update(dropped)
 
             for req_id in finished_stores:
                 self._completed_store_requests[req_id] = 1
@@ -2060,6 +2072,7 @@ class LMCacheMPWorkerAdapter:
             finished_retrieves.add(request_id)
 
             if not r_result:
+                self._failed_recving_request_ids.add(request_id)
                 self.error_block_ids.update(r_block_ids)
                 logger.error(
                     "Something went wrong when processing the "
@@ -2085,6 +2098,7 @@ class LMCacheMPWorkerAdapter:
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
+        self._failed_recving_request_ids.update(dropped)
 
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
@@ -2142,6 +2156,20 @@ class LMCacheMPWorkerAdapter:
         errors = self.error_block_ids.copy()
         self.error_block_ids.clear()
         return errors
+
+    def get_failed_recving_request_ids(self) -> set[str]:
+        """Drain request IDs whose asynchronous KV receive failed.
+
+        Call this after :meth:`get_finished`; every returned request ID is
+        included in that call's finished-receiving set. Request IDs remain
+        unambiguous when block IDs overlap across KV cache groups.
+
+        Returns:
+            Failed receive request IDs since the previous call.
+        """
+        failed_request_ids = self._failed_recving_request_ids.copy()
+        self._failed_recving_request_ids.clear()
+        return failed_request_ids
 
     def handle_preemptions(self, need_flush_before_forward: bool) -> None:
         """Handle worker-side preemption hints from connector metadata.
